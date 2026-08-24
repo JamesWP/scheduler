@@ -1,0 +1,33 @@
+# Demo: 3 nodes, 4 workloads exercising real scheduler behaviour.
+nodes:
+  - name: node-a
+    cpu: "4"
+    memory: 8Gi
+    labels: {zone: eu-west-1a}
+  - name: node-b
+    cpu: "4"
+    memory: 8Gi
+    labels: {zone: eu-west-1b}
+  - name: node-c
+    cpu: "2"
+    memory: 4Gi
+    labels: {zone: eu-west-1a}
+
+workloads:
+  - name: web
+    replicas: 3
+    cpu: 500m
+    memory: 512Mi
+  - name: db
+    replicas: 1
+    cpu: "2"
+    memory: 4Gi
+    nodeSelector: {zone: eu-west-1b}   # must land on node-b
+  - name: batch
+    replicas: 2
+    cpu: "1"
+    memory: 1Gi
+  - name: too-big               # no node has 16 CPUs -> expect Unschedulable
+    replicas: 1
+    cpu: "16"
+    memory: 1Gi
