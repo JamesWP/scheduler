@@ -21,6 +21,7 @@ Requires: podman, python3, PyYAML (`pip install pyyaml`; JSON input works withou
 
 ```bash
 python3 -m schedsim up                # start the control plane (localhost:6443)
+python3 -m schedsim gen -o input.yaml # synthesise a scenario (see below)
 python3 -m schedsim run input.yaml    # schedule and print the allocation
 python3 -m schedsim down              # tear down
 ```
@@ -61,6 +62,46 @@ too-big   too-big-0  —       Unschedulable: 0/3 nodes are available: 3 Insuffi
 ```
 
 Unschedulable messages come verbatim from the real scheduler.
+
+## Generating scenarios
+
+`schedsim gen` writes an input file (YAML, or `--json`) instead of you
+hand-writing one:
+
+```bash
+python3 -m schedsim gen --nodes 100 --node-cpu 16 --workloads 500 --seed 1 -o big.yaml
+python3 -m schedsim run big.yaml
+```
+
+Cluster shape: `--nodes N`, `--node-cpu` (processors per host),
+`--node-memory` (defaults to `--memory-per-cpu`, 4Gi, times the CPU count),
+`--zones N` to label nodes `zone-0..N-1`.
+
+Workload shape: `--workloads N`, `--replicas SPEC` (instances per workload),
+`--cpu SPEC` (demand per instance), `--memory-per-pod-cpu` (defaults to 2Gi
+per CPU of demand), `--name-prefix`, `--seed` for reproducibility.
+
+`SPEC` is a distribution; numbers accept k8s units where they're CPU values:
+
+| spec | meaning |
+| --- | --- |
+| `fixed:V` | always V |
+| `uniform:LO,HI` | uniform in [LO, HI] |
+| `exp:MEAN` | exponential with that mean |
+| `pareto:MIN,ALPHA` | power law, x ≥ MIN (ALPHA ≈ 1.2 is very heavy-tailed) |
+| `mixture:BASE,P,MAX` | BASE with probability 1−P, else log-uniform in [BASE, MAX] |
+
+`--replicas` defaults to `mixture:4,0.05`: most workloads are 4 pods, 5% run
+away up to MAX, which defaults to 80% of the node count — the rare whale that
+wants an instance on nearly every host. Replica counts are capped there and
+per-instance CPU is capped at one node's CPU, so a generated pod is always
+placeable in principle. Writing to `-o` prints a capacity-vs-demand summary
+(also kept as a comment at the top of the file):
+
+```
+wrote big.yaml: 100 nodes (1600 cpu, 6400Gi), 500 workloads / 2453 pods
+requesting 1226500m cpu (77%), 2453Gi memory (38%)
+```
 
 ## Poking at the cluster directly
 
