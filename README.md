@@ -30,6 +30,15 @@ python3 -m schedsim down              # tear down
 cluster for inspection), `--timeout N`. Exit code 2 if anything was
 unschedulable.
 
+`--timeout` (default 30s) is a *no-progress* budget, not a total runtime cap:
+it resets every time another pod is placed, so a scenario with thousands of
+pods just keeps going while progress is being made. Creation and scheduling
+progress is reported on stderr.
+
+If a run is interrupted, its nodes are left behind and the next run fails
+with `already exists`. etcd lives inside the container, so a restart keeps
+them — reset with `python3 -m schedsim down && python3 -m schedsim up`.
+
 ## Input format
 
 ```yaml

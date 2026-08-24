@@ -20,7 +20,7 @@ class KubeClient:
         self.ctx.check_hostname = False
         self.ctx.verify_mode = ssl.CERT_NONE
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, timeout=10):
         req = urllib.request.Request(self.server + path, method=method)
         req.add_header("Authorization", f"Bearer {self.token}")
         data = None
@@ -30,7 +30,8 @@ class KubeClient:
                            "application/merge-patch+json" if method == "PATCH"
                            else "application/json")
         try:
-            with urllib.request.urlopen(req, data=data, context=self.ctx, timeout=10) as resp:
+            with urllib.request.urlopen(req, data=data, context=self.ctx,
+                                        timeout=timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")
@@ -54,8 +55,8 @@ class KubeClient:
     def post(self, path, body):
         return self.request("POST", path, body)
 
-    def delete(self, path, body=None):
-        return self.request("DELETE", path, body)
+    def delete(self, path, body=None, timeout=10):
+        return self.request("DELETE", path, body, timeout=timeout)
 
     def patch(self, path, body):
         return self.request("PATCH", path, body)
@@ -84,6 +85,12 @@ class KubeClient:
 
     def list_pods(self, namespace):
         return self.get(f"/api/v1/namespaces/{namespace}/pods")["items"]
+
+    def delete_pods(self, namespace):
+        """Delete every pod in the namespace in one call, no grace period."""
+        # Deleting thousands of pods in one call takes a while server-side.
+        return self.delete(f"/api/v1/namespaces/{namespace}/pods",
+                           {"gracePeriodSeconds": 0}, timeout=300)
 
     def delete_node(self, name):
         return self.delete(f"/api/v1/nodes/{name}")

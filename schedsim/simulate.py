@@ -1,11 +1,33 @@
 """Turn a simplified nodes/workloads spec into k8s objects, schedule, report."""
 
+import concurrent.futures
+import sys
 import time
 import uuid
 
 from .kube import KubeError
 
 KWOK_TAINT = {"key": "kwok.x-k8s.io/node", "value": "fake", "effect": "NoSchedule"}
+
+# Each object is a separate apiserver round trip (~25ms), so a few thousand
+# pods take a minute serially. The apiserver copes fine with a handful of
+# concurrent writers.
+WRITE_CONCURRENCY = 16
+
+
+def _create_all(create, items, label, progress=True):
+    """Create objects concurrently, reporting progress on stderr."""
+    if not items:
+        return
+    done = 0
+    started = time.time()
+    with concurrent.futures.ThreadPoolExecutor(WRITE_CONCURRENCY) as pool:
+        for _ in pool.map(create, items):
+            done += 1
+            if progress and (done % 100 == 0 or done == len(items)):
+                print(f"\rcreating {label}: {done}/{len(items)}",
+                      end="" if done < len(items) else
+                      f" ({time.time() - started:.1f}s)\n", file=sys.stderr, flush=True)
 
 
 def node_manifest(spec):
@@ -67,24 +89,28 @@ def run(client, config, timeout=30, keep=False):
     client.create_namespace(namespace)
     created_nodes = []
     try:
-        for node in config.get("nodes", []):
-            if node.get("kind") == "Node":  # raw manifest pass-through
-                manifest = node
-            else:
-                manifest = node_manifest(node)
-            client.create_node(manifest)
-            created_nodes.append(manifest["metadata"]["name"])
+        node_manifests = [n if n.get("kind") == "Node"  # raw manifest pass-through
+                          else node_manifest(n) for n in config.get("nodes", [])]
+        created_nodes = [n["metadata"]["name"] for n in node_manifests]
+        try:
+            _create_all(client.create_node, node_manifests, "nodes")
+        except KubeError as e:
+            if "already exists" not in str(e):
+                raise
+            created_nodes = []  # don't delete nodes this run didn't create
+            raise SystemExit(
+                f"{e}\nnodes from an earlier run are still in the cluster; "
+                f"reset with: python3 -m schedsim down && python3 -m schedsim up")
         _wait_for_nodes_ready(client, created_nodes, timeout)
 
-        expected = []
+        pods = []
         for workload in config.get("workloads", []):
             if workload.get("kind") == "Pod":  # raw manifest pass-through
-                pods = [workload]
+                pods.append(workload)
             else:
-                pods = pod_manifests(workload)
-            for pod in pods:
-                client.create_pod(namespace, pod)
-                expected.append(pod["metadata"]["name"])
+                pods.extend(pod_manifests(workload))
+        expected = [p["metadata"]["name"] for p in pods]
+        _create_all(lambda pod: client.create_pod(namespace, pod), pods, "pods")
 
         rows = _wait_for_scheduling(client, namespace, expected, timeout)
     finally:
@@ -93,17 +119,20 @@ def run(client, config, timeout=30, keep=False):
                   f"(inspect: podman exec schedsim kubectl -n {namespace} get pods -o wide)")
         else:
             try:
-                # Force-delete pods before their nodes go away, otherwise they
-                # hang in Terminating (kwok only finalizes pods on live nodes).
-                for pod in client.list_pods(namespace):
-                    client.delete(
-                        f"/api/v1/namespaces/{namespace}/pods/{pod['metadata']['name']}",
-                        {"gracePeriodSeconds": 0})
+                # Force-delete pods and wait for them to actually go before
+                # removing their nodes, otherwise stragglers hang in
+                # Terminating (kwok only finalizes pods on live nodes).
+                client.delete_pods(namespace)
+                _wait_for_pods_gone(client, namespace, timeout)
                 client.delete_namespace(namespace)
-                for name in created_nodes:
-                    client.delete_node(name)
-            except KubeError:
-                pass
+                _create_all(client.delete_node, created_nodes, "deleting nodes",
+                            progress=False)
+            except KubeError as e:
+                # etcd lives in the container, so only a rebuild is a
+                # guaranteed reset -- a restart keeps the leftovers.
+                print(f"cleanup incomplete ({e}); reset with: "
+                      f"python3 -m schedsim down && python3 -m schedsim up",
+                      file=sys.stderr)
     return rows
 
 
@@ -129,8 +158,29 @@ def _wait_for_nodes_ready(client, names, timeout):
                      "(is the kwok controller running? podman logs schedsim)")
 
 
-def _wait_for_scheduling(client, namespace, expected, timeout):
+def _wait_for_pods_gone(client, namespace, timeout):
     deadline = time.time() + timeout
+    remaining = None
+    while time.time() < deadline:
+        left = len(client.list_pods(namespace))
+        if not left:
+            return
+        if remaining is None or left < remaining:  # still draining, keep waiting
+            remaining, deadline = left, time.time() + timeout
+        time.sleep(0.5)
+    raise KubeError(f"{remaining} pods in {namespace} did not terminate "
+                    f"within {timeout}s")
+
+
+def _wait_for_scheduling(client, namespace, expected, timeout):
+    """Poll until every pod is bound or unschedulable.
+
+    `timeout` is the budget for making *no* progress: a large scenario can
+    take far longer than that overall, so the deadline is extended each time
+    another pod settles.
+    """
+    deadline = time.time() + timeout
+    best = 0
     rows = {}
     while time.time() < deadline:
         rows = {}
@@ -150,8 +200,19 @@ def _wait_for_scheduling(client, namespace, expected, timeout):
             else:
                 settled = False
         if settled and len(rows) == len(expected):
+            if best:
+                print(f"\rscheduling: {len(expected)}/{len(expected)}",
+                      file=sys.stderr)
             break
+        if len(rows) > best:
+            best = len(rows)
+            deadline = time.time() + timeout
+            print(f"\rscheduling: {best}/{len(expected)}", end="",
+                  file=sys.stderr, flush=True)
         time.sleep(0.5)
+    else:
+        print(f"\rgave up after {timeout}s with no further progress "
+              f"({len(rows)}/{len(expected)} settled)", file=sys.stderr)
     for name in expected:
         rows.setdefault(name, {"pod": name, "node": None, "status": "Pending (timed out)",
                                "workload": name})
