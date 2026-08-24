@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# generated scenarios
+/big.yaml
