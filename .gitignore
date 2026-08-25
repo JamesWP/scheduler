@@ -3,3 +3,6 @@ __pycache__/
 
 # generated scenarios
 /big.yaml
+
+# generated run output
+/results.csv

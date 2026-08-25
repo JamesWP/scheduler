@@ -8,8 +8,10 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import sys
+from collections import Counter
 
 from . import cluster, generate, simulate
 
@@ -40,12 +42,29 @@ def dump_config(config, as_json=False):
     return json.dumps(config, indent=2) + "\n"
 
 
-def print_table(rows):
-    headers = ["WORKLOAD", "POD", "NODE", "STATUS"]
-    table = [[r["workload"], r["pod"], r["node"] or "—", r["status"]] for r in rows]
-    widths = [max(len(str(row[i])) for row in [headers] + table) for i in range(4)]
-    for row in [headers] + table:
-        print("  ".join(str(cell).ljust(w) for cell, w in zip(row, widths)).rstrip())
+def write_csv(rows, path):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["workload", "pod", "node", "status"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_summary(rows):
+    total = len(rows)
+    scheduled = [r for r in rows if r["node"]]
+    unscheduled = [r for r in rows if not r["node"]]
+    print(f"{len(scheduled)}/{total} pods scheduled")
+    if unscheduled:
+        for status, count in Counter(r["status"] for r in unscheduled).most_common():
+            print(f"  {count}  {status}")
+        by_workload = Counter(r["workload"] for r in unscheduled)
+        top = ", ".join(f"{w} ({c})" for w, c in by_workload.most_common(5))
+        more = f", +{len(by_workload) - 5} more" if len(by_workload) > 5 else ""
+        print(f"  affected workloads: {top}{more}")
+    node_counts = Counter(r["node"] for r in scheduled)
+    if node_counts:
+        busiest, count = node_counts.most_common(1)[0]
+        print(f"{len(node_counts)} nodes used (busiest: {busiest} with {count} pods)")
 
 
 def main():
@@ -56,6 +75,8 @@ def main():
     run_p = sub.add_parser("run", help="schedule workloads onto nodes and print the allocation")
     run_p.add_argument("input", help="YAML/JSON file with nodes: and workloads:")
     run_p.add_argument("--json", action="store_true", help="machine-readable output")
+    run_p.add_argument("--csv", help="write full per-pod results here as CSV; "
+                       "prints a summary to stdout instead of the table")
     run_p.add_argument("--keep", action="store_true",
                        help="leave nodes/pods in the cluster for inspection")
     run_p.add_argument("--timeout", type=int, default=30,
@@ -95,10 +116,16 @@ def main():
         config = load_config(args.input)
         client = cluster.up()
         rows = simulate.run(client, config, timeout=args.timeout, keep=args.keep)
-        if args.json:
+        if args.csv:
+            write_csv(rows, args.csv)
+            print(f"wrote {len(rows)} rows to {args.csv}")
+            print_summary(rows)
+        elif args.json:
             print(json.dumps(rows, indent=2))
         else:
-            print_table(rows)
+            print_summary(rows)
+            print("\nfor full per-pod results, rerun with --csv FILE or --json",
+                  file=sys.stderr)
         if any(r["node"] is None for r in rows):
             sys.exit(2)
     elif args.command == "gen":

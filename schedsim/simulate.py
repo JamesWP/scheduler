@@ -15,8 +15,28 @@ KWOK_TAINT = {"key": "kwok.x-k8s.io/node", "value": "fake", "effect": "NoSchedul
 WRITE_CONCURRENCY = 16
 
 
+def _call_with_heartbeat(fn, label):
+    """Run a single blocking call on a thread, printing elapsed time while it's in flight."""
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        future = pool.submit(fn)
+        started = time.time()
+        while True:
+            try:
+                result = future.result(timeout=1)
+                break
+            except concurrent.futures.TimeoutError:
+                print(f"\r{label}... ({time.time() - started:.0f}s)",
+                      end="", file=sys.stderr, flush=True)
+        print(f"\r{label}: done ({time.time() - started:.1f}s)",
+              file=sys.stderr, flush=True)
+        return result
+
+
 def _create_all(create, items, label, progress=True):
-    """Create objects concurrently, reporting progress on stderr."""
+    """Run `create` over items concurrently, reporting progress on stderr.
+
+    `label` is the full progress phrase, e.g. "creating nodes" or "deleting pods".
+    """
     if not items:
         return
     done = 0
@@ -25,7 +45,7 @@ def _create_all(create, items, label, progress=True):
         for _ in pool.map(create, items):
             done += 1
             if progress and (done % 100 == 0 or done == len(items)):
-                print(f"\rcreating {label}: {done}/{len(items)}",
+                print(f"\r{label}: {done}/{len(items)}",
                       end="" if done < len(items) else
                       f" ({time.time() - started:.1f}s)\n", file=sys.stderr, flush=True)
 
@@ -88,12 +108,13 @@ def run(client, config, timeout=30, keep=False):
     namespace = "sim-" + uuid.uuid4().hex[:8]
     client.create_namespace(namespace)
     created_nodes = []
+    expected = []
     try:
         node_manifests = [n if n.get("kind") == "Node"  # raw manifest pass-through
                           else node_manifest(n) for n in config.get("nodes", [])]
         created_nodes = [n["metadata"]["name"] for n in node_manifests]
         try:
-            _create_all(client.create_node, node_manifests, "nodes")
+            _create_all(client.create_node, node_manifests, "creating nodes")
         except KubeError as e:
             if "already exists" not in str(e):
                 raise
@@ -110,7 +131,7 @@ def run(client, config, timeout=30, keep=False):
             else:
                 pods.extend(pod_manifests(workload))
         expected = [p["metadata"]["name"] for p in pods]
-        _create_all(lambda pod: client.create_pod(namespace, pod), pods, "pods")
+        _create_all(lambda pod: client.create_pod(namespace, pod), pods, "creating pods")
 
         rows = _wait_for_scheduling(client, namespace, expected, timeout)
     finally:
@@ -122,11 +143,12 @@ def run(client, config, timeout=30, keep=False):
                 # Force-delete pods and wait for them to actually go before
                 # removing their nodes, otherwise stragglers hang in
                 # Terminating (kwok only finalizes pods on live nodes).
-                client.delete_pods(namespace)
+                _create_all(lambda name: client.delete_pod(namespace, name),
+                            expected, "deleting pods")
                 _wait_for_pods_gone(client, namespace, timeout)
-                client.delete_namespace(namespace)
-                _create_all(client.delete_node, created_nodes, "deleting nodes",
-                            progress=False)
+                _call_with_heartbeat(lambda: client.delete_namespace(namespace),
+                                    "deleting namespace")
+                _create_all(client.delete_node, created_nodes, "deleting nodes")
             except KubeError as e:
                 # etcd lives in the container, so only a rebuild is a
                 # guaranteed reset -- a restart keeps the leftovers.
@@ -161,13 +183,24 @@ def _wait_for_nodes_ready(client, names, timeout):
 def _wait_for_pods_gone(client, namespace, timeout):
     deadline = time.time() + timeout
     remaining = None
+    started = time.time()
+    last_print = 0
     while time.time() < deadline:
         left = len(client.list_pods(namespace))
         if not left:
+            if remaining is not None:
+                print(f"\rpods terminated ({time.time() - started:.1f}s)",
+                      file=sys.stderr, flush=True)
             return
         if remaining is None or left < remaining:  # still draining, keep waiting
             remaining, deadline = left, time.time() + timeout
+        now = time.time()
+        if now - last_print >= 1:  # tick even when the count hasn't moved
+            print(f"\rwaiting for pods to terminate: {left} left "
+                  f"({now - started:.0f}s)", end="", file=sys.stderr, flush=True)
+            last_print = now
         time.sleep(0.5)
+    print(file=sys.stderr)
     raise KubeError(f"{remaining} pods in {namespace} did not terminate "
                     f"within {timeout}s")
 
