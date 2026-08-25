@@ -31,16 +31,24 @@ RUN mkdir -p /etc/kwok/stages \
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl ca-certificates python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# The run API (image/server/) is the only Python in the image; an isolated
+# venv avoids fighting Debian's PEP 668 "externally managed" pip.
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir fastapi 'uvicorn[standard]'
+ENV PATH="/opt/venv/bin:${PATH}"
 
 COPY --from=downloader /usr/local/bin/kube-apiserver /usr/local/bin/kube-scheduler \
      /usr/local/bin/kube-controller-manager /usr/local/bin/kubectl \
      /usr/local/bin/etcd /usr/local/bin/kwok /usr/local/bin/
 
 COPY --from=downloader /etc/kwok/stages /etc/kwok/stages
+COPY server/ /opt/schedsim/server/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 6443
+EXPOSE 6443 8080
 ENTRYPOINT ["/entrypoint.sh"]

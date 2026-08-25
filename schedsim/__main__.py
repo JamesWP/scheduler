@@ -2,18 +2,16 @@
 
 Usage:
   python -m schedsim up             # build/start the control-plane container
-  python -m schedsim run input.yaml [--json] [--keep] [--timeout N]
+  python -m schedsim run input.yaml [--json] [--keep]
   python -m schedsim gen [options] [-o out.yaml]   # synthesise a scenario
   python -m schedsim down           # remove the container
 """
 
 import argparse
-import csv
 import json
 import sys
-from collections import Counter
 
-from . import cluster, generate, simulate
+from . import apiclient, cluster, generate, presentation
 
 
 def load_config(path):
@@ -42,29 +40,24 @@ def dump_config(config, as_json=False):
     return json.dumps(config, indent=2) + "\n"
 
 
-def write_csv(rows, path):
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["workload", "pod", "node", "status"])
-        writer.writeheader()
-        writer.writerows(rows)
+def do_run(server, config, timeout, keep):
+    """Drive apiclient.run(), rendering progress as it streams in.
 
-
-def print_summary(rows):
-    total = len(rows)
-    scheduled = [r for r in rows if r["node"]]
-    unscheduled = [r for r in rows if not r["node"]]
-    print(f"{len(scheduled)}/{total} pods scheduled")
-    if unscheduled:
-        for status, count in Counter(r["status"] for r in unscheduled).most_common():
-            print(f"  {count}  {status}")
-        by_workload = Counter(r["workload"] for r in unscheduled)
-        top = ", ".join(f"{w} ({c})" for w, c in by_workload.most_common(5))
-        more = f", +{len(by_workload) - 5} more" if len(by_workload) > 5 else ""
-        print(f"  affected workloads: {top}{more}")
-    node_counts = Counter(r["node"] for r in scheduled)
-    if node_counts:
-        busiest, count = node_counts.most_common(1)[0]
-        print(f"{len(node_counts)} nodes used (busiest: {busiest} with {count} pods)")
+    Returns the final rows; exits the process on a server-reported error.
+    """
+    rows = None
+    for event in apiclient.run(server, config, timeout=timeout, keep=keep):
+        phase = event["phase"]
+        if phase == "done":
+            rows = event["rows"]
+            break
+        if phase == "error":
+            raise SystemExit(f"run failed: {event['message']}")
+        presentation.print_progress(event)
+    if rows is None:
+        raise SystemExit("run ended unexpectedly with no result "
+                         "(did the server connection drop?)")
+    return rows
 
 
 def main():
@@ -114,16 +107,16 @@ def main():
         print("removed")
     elif args.command == "run":
         config = load_config(args.input)
-        client = cluster.up()
-        rows = simulate.run(client, config, timeout=args.timeout, keep=args.keep)
+        server = cluster.up()
+        rows = do_run(server, config, timeout=args.timeout, keep=args.keep)
         if args.csv:
-            write_csv(rows, args.csv)
+            presentation.write_csv(rows, args.csv)
             print(f"wrote {len(rows)} rows to {args.csv}")
-            print_summary(rows)
+            presentation.print_summary(rows)
         elif args.json:
             print(json.dumps(rows, indent=2))
         else:
-            print_summary(rows)
+            presentation.print_summary(rows)
             print("\nfor full per-pod results, rerun with --csv FILE or --json",
                   file=sys.stderr)
         if any(r["node"] is None for r in rows):
