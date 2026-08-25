@@ -104,7 +104,11 @@ kwok \
   "${KWOK_STAGE_ARGS[@]}" \
   >/var/log/kwok.log 2>&1 &
 
-echo "schedsim control plane up (etcd, kube-apiserver, kube-scheduler, kwok)"
+# --- schedsim run API ---------------------------------------------------
+(cd /opt/schedsim && uvicorn server.app:app --host 0.0.0.0 --port 8080) \
+  >/var/log/schedsim-api.log 2>&1 &
+
+echo "schedsim control plane up (etcd, kube-apiserver, kube-scheduler, kwok, run API)"
 
 # Exit when any component exits, so the container fails loudly.
 wait -n

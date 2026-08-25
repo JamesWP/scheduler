@@ -4,10 +4,12 @@ Answers "given these nodes and these workloads, where would the **real**
 Kubernetes scheduler place things?" without a real cluster.
 
 A single container (run via podman) bundles etcd, kube-apiserver,
-kube-scheduler, kube-controller-manager (namespace + GC controllers only) and
-the [KWOK](https://kwok.sigs.k8s.io/) controller, which fakes kubelets so
-nodes go Ready and pods run without any real workloads. The `schedsim` Python
-CLI feeds it node/workload definitions and reports the allocation.
+kube-scheduler, kube-controller-manager (namespace + GC controllers only), the
+[KWOK](https://kwok.sigs.k8s.io/) controller (which fakes kubelets so nodes go
+Ready and pods run without any real workloads), and a small FastAPI service
+that drives the whole simulation. The `schedsim` Python CLI is presentation
+only: it parses the input file, POSTs it to that in-container API, and
+renders the streamed progress and final allocation.
 
 ## Quick start
 
@@ -20,20 +22,23 @@ Requires: podman, python3, PyYAML (`pip install pyyaml`; JSON input works withou
 ## Usage
 
 ```bash
-python3 -m schedsim up                # start the control plane (localhost:6443)
+python3 -m schedsim up                # start the control plane (localhost:6443, API on :8080)
 python3 -m schedsim gen -o input.yaml # synthesise a scenario (see below)
-python3 -m schedsim run input.yaml    # schedule and print the allocation
+python3 -m schedsim run input.yaml    # schedule and print a summary
 python3 -m schedsim down              # tear down
 ```
 
-`run` flags: `--json` (machine-readable), `--keep` (leave objects in the
-cluster for inspection), `--timeout N`. Exit code 2 if anything was
-unschedulable.
+`run` flags: `--json` (full per-pod results as JSON) or `--csv FILE` (full
+per-pod results as CSV, plus the summary on stdout), `--keep` (leave objects
+in the cluster for inspection), `--timeout N`. Exit code 2 if anything was
+unschedulable. With neither `--json` nor `--csv`, only the summary prints,
+with a hint to rerun with one of those flags for the full data.
 
 `--timeout` (default 30s) is a *no-progress* budget, not a total runtime cap:
 it resets every time another pod is placed, so a scenario with thousands of
-pods just keeps going while progress is being made. Creation and scheduling
-progress is reported on stderr.
+pods just keeps going while progress is being made. Every phase — creating
+nodes/pods, scheduling, and the deletion/cleanup that follows — streams live
+progress to stderr for the whole run, not just the first half.
 
 If a run is interrupted, its nodes are left behind and the next run fails
 with `already exists`. etcd lives inside the container, so a restart keeps
@@ -64,13 +69,17 @@ Raw Kubernetes manifests also work: any entry with `kind: Node` /
 Example output:
 
 ```
-WORKLOAD  POD        NODE    STATUS
-web       web-0      node-c  Scheduled
-db        db-0       node-b  Scheduled
-too-big   too-big-0  —       Unschedulable: 0/3 nodes are available: 3 Insufficient cpu. ...
+2/3 pods scheduled
+  1  Unschedulable: 0/3 nodes are available: 3 Insufficient cpu. ...
+  affected workloads: too-big (1)
+2 nodes used (busiest: node-c with 1 pods)
+
+for full per-pod results, rerun with --csv FILE or --json
 ```
 
-Unschedulable messages come verbatim from the real scheduler.
+Unschedulable messages come verbatim from the real scheduler; they're
+preserved in full in the `--csv`/`--json` output even though the summary
+only counts them.
 
 ## Generating scenarios
 
@@ -120,19 +129,30 @@ kubectl ships inside the image; the host needs nothing:
 podman exec -it schedsim kubectl get nodes,pods -A -o wide
 ```
 
-Or hit the API from the host: `https://127.0.0.1:6443` with bearer token
+Or hit the k8s API from the host: `https://127.0.0.1:6443` with bearer token
 `schedsim-token` (self-signed cert — this is a local sim, auth is a formality).
+The run API itself is unauthenticated plain HTTP on `:8080` — same trust
+level as the podman socket that already controls the container.
 
 ## How it works
 
-1. `schedsim run` creates a throwaway namespace, then Node objects annotated
-   `kwok.x-k8s.io/node: fake` — the KWOK controller adopts them and marks
-   them Ready (the CLI then strips the `not-ready` admission taint, standing
-   in for the node lifecycle controller, which isn't running).
+The core logic (`image/server/`) runs *inside* the container as a FastAPI
+service, since it's the one place that can talk to the local apiserver
+directly; the host-side `schedsim` CLI never speaks raw Kubernetes REST.
+
+1. The CLI POSTs the parsed input to `POST /run`; the server creates a
+   throwaway namespace, then Node objects annotated `kwok.x-k8s.io/node:
+   fake` — the KWOK controller adopts them and marks them Ready (the server
+   then strips the `not-ready` admission taint, standing in for the node
+   lifecycle controller, which isn't running).
 2. Workloads become Pods (replicas expanded to `name-0..n`) with resource
    requests; the untouched upstream kube-scheduler binds them.
-3. The CLI polls until every pod is bound or unschedulable, prints the table,
-   and deletes everything it created (unless `--keep`).
+3. The server polls until every pod is bound or unschedulable, streaming
+   newline-delimited JSON progress events back over the same connection, then
+   deletes everything it created (unless `--keep`) and streams a final
+   `{"phase": "done", "rows": [...]}` event.
+4. The CLI renders each event as it arrives and, once `rows` shows up, prints
+   the summary (or writes `--csv`/`--json`).
 
 Component versions are pinned in `image/Dockerfile` (k8s v1.31.4,
 etcd v3.5.17, kwok v0.6.1).
