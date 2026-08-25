@@ -86,11 +86,10 @@ class KubeClient:
     def list_pods(self, namespace):
         return self.get(f"/api/v1/namespaces/{namespace}/pods")["items"]
 
-    def delete_pods(self, namespace):
-        """Delete every pod in the namespace in one call, no grace period."""
-        # Deleting thousands of pods in one call takes a while server-side.
-        return self.delete(f"/api/v1/namespaces/{namespace}/pods",
-                           {"gracePeriodSeconds": 0}, timeout=300)
+    def delete_pod(self, namespace, name):
+        """Force-delete one pod, no grace period."""
+        return self.delete(f"/api/v1/namespaces/{namespace}/pods/{name}",
+                           {"gracePeriodSeconds": 0})
 
     def delete_node(self, name):
         return self.delete(f"/api/v1/nodes/{name}")
