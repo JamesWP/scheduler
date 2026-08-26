@@ -54,6 +54,19 @@ class Store:
         self._rv = itertools.count(1)
         self._last_rv = 0
         self._watchers = {}
+        # The uvicorn event loop, captured once it's running (see app.py's
+        # lifespan hook). publish() can be called from that loop's own
+        # coroutines (the HTTP layer below) or from a worker thread
+        # (simulate.py's writes, since its sync /run handler -- and the
+        # generator it returns -- run in FastAPI's threadpool, not on the
+        # loop). asyncio.Queue isn't thread-safe: a bare put_nowait() from
+        # the wrong thread can sit for seconds before a waiting watch
+        # coroutine notices. call_soon_threadsafe is the documented safe
+        # way to hand it to the loop from either kind of caller.
+        self._loop = None
+
+    def set_loop(self, loop):
+        self._loop = loop
 
     def next_rv(self):
         self._last_rv = next(self._rv)
@@ -85,8 +98,15 @@ class Store:
         return self._watchers.setdefault((group, resource), [])
 
     def publish(self, group, resource, event_type, obj):
-        for q in list(self.watchers(group, resource)):
-            q.put_nowait({"type": event_type, "object": obj})
+        event = {"type": event_type, "object": obj}
+        queues = list(self.watchers(group, resource))
+        if not queues:
+            return
+        for q in queues:
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(q.put_nowait, event)
+            else:
+                q.put_nowait(event)  # no loop registered yet (e.g. a unit test)
 
 
 STORE = Store()
@@ -154,6 +174,12 @@ def _hook_namespace(obj):
 
 def _hook_pod(obj):
     obj.setdefault("status", {}).setdefault("phase", "Pending")
+    # The real apiserver defaults an empty schedulerName to
+    # "default-scheduler" at create time (k8s.io/api/core/v1/defaults.go).
+    # kube-scheduler's own informer event handlers silently ignore any pod
+    # whose schedulerName doesn't match theirs -- no error, no log line,
+    # it just never gets scheduled -- so this default isn't optional.
+    obj.setdefault("spec", {}).setdefault("schedulerName", "default-scheduler")
 
 
 POST_CREATE_HOOKS = {

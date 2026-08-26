@@ -34,9 +34,15 @@ done
 echo "fake apiserver ready"
 
 # --- kube-scheduler (unmodified upstream binary) --------------------------
+# --kube-api-content-type=json: kube-scheduler's client defaults to sending
+# protobuf-encoded request bodies (POST/PUT), which this fake apiserver
+# doesn't decode. This flag is a standard, documented client-go setting --
+# it doesn't touch the binary -- that gets the scheduler to speak the JSON
+# this fake apiserver actually understands.
 kube-scheduler \
   --kubeconfig="$KUBECONFIG_PATH" \
   --leader-elect=false \
+  --kube-api-content-type=application/json \
   >/var/log/kube-scheduler.log 2>&1 &
 
 echo "schedsim control plane up (fake apiserver, run API, kube-scheduler)"

@@ -165,6 +165,15 @@ simulations against it:
   kube-scheduler and kubectl processes go through the HTTP router.
   `app.py` wires `POST /run` to `simulate.run()`.
 
+Two things that only showed up testing against the real kube-scheduler
+binary, not visible from the API shape alone: it defaults to sending
+POST/PUT bodies (including the bind call) as protobuf, not JSON, so
+`entrypoint.sh` passes `--kube-api-content-type=application/json` --
+a standard client-go flag, not a binary patch; and the real apiserver
+defaults an unset `pod.spec.schedulerName` to `"default-scheduler"` on
+create, which `fakeapi.py`'s pod-creation hook now does too, since a
+scheduler silently ignores any pod addressed to a different name.
+
 The `POST /run` flow itself:
 
 1. The CLI POSTs the parsed input to `POST /run`; the server creates a

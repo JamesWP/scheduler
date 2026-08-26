@@ -15,7 +15,9 @@ directly (no HTTP, they're the same process); only the external
 kube-scheduler and kubectl processes go through the router below.
 """
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -23,7 +25,17 @@ from pydantic import BaseModel
 
 from . import fakeapi, simulate
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # simulate.py writes to fakeapi.STORE from a worker thread (see /run
+    # below), but its watch queues belong to this event loop; publish()
+    # needs the loop handle to hand cross-thread notifications to it safely.
+    fakeapi.STORE.set_loop(asyncio.get_running_loop())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.include_router(fakeapi.router)
 
 
