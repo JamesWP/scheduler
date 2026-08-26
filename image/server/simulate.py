@@ -1,9 +1,9 @@
 """Turn a simplified nodes/workloads spec into k8s objects, schedule, report.
 
-Runs inside the control-plane container, talking to the local apiserver.
-Every long-running step is a generator that `yield`s progress dicts instead
-of printing — the API layer (app.py) forwards those as NDJSON to the CLI,
-which is what actually renders them.
+Runs inside the control-plane container, talking to the local fake
+apiserver (fakeapi.py). Every long-running step is a generator that
+`yield`s progress dicts instead of printing — the API layer (app.py)
+forwards those as NDJSON to the CLI, which is what actually renders them.
 """
 
 import concurrent.futures
@@ -12,7 +12,10 @@ import uuid
 
 from .kube import KubeError
 
-KWOK_TAINT = {"key": "kwok.x-k8s.io/node", "value": "fake", "effect": "NoSchedule"}
+# Nodes are tainted so only pods that explicitly tolerate "the scheduler's
+# playground isn't a real, workload-bearing node" land on them -- a real
+# taint would come from a real kubelet; here it's just bookkeeping.
+FAKE_NODE_TAINT = {"key": "schedsim.local/fake-node", "value": "true", "effect": "NoSchedule"}
 
 # Each object is a separate apiserver round trip (~25ms), so a few thousand
 # pods take a minute serially. The apiserver copes fine with a handful of
@@ -62,7 +65,7 @@ def node_manifest(spec):
     resources = {"cpu": str(spec.get("cpu", "4")),
                  "memory": str(spec.get("memory", "8Gi")),
                  "pods": str(spec.get("pods", "110"))}
-    labels = {"type": "kwok", "kubernetes.io/role": "agent",
+    labels = {"type": "fake", "kubernetes.io/role": "agent",
               "kubernetes.io/hostname": spec["name"]}
     labels.update(spec.get("labels", {}))
     return {
@@ -71,9 +74,8 @@ def node_manifest(spec):
         "metadata": {
             "name": spec["name"],
             "labels": labels,
-            "annotations": {"kwok.x-k8s.io/node": "fake"},
         },
-        "spec": {"taints": [KWOK_TAINT]},
+        "spec": {"taints": [FAKE_NODE_TAINT]},
         "status": {"capacity": resources, "allocatable": dict(resources)},
     }
 
@@ -91,7 +93,7 @@ def pod_manifests(spec):
             "image": spec.get("image", "registry.k8s.io/pause:3.9"),
             "resources": {"requests": requests, "limits": dict(spec.get("limits", {}))},
         }],
-        "tolerations": [dict(KWOK_TAINT, operator="Equal")],
+        "tolerations": [dict(FAKE_NODE_TAINT, operator="Equal")],
     }
     for key in ("nodeSelector", "affinity", "topologySpreadConstraints",
                 "priorityClassName", "nodeName"):
@@ -153,9 +155,10 @@ def run(client, config, timeout=30, keep=False):
             yield {"phase": "kept", "namespace": namespace}
         else:
             try:
-                # Force-delete pods and wait for them to actually go before
-                # removing their nodes, otherwise stragglers hang in
-                # Terminating (kwok only finalizes pods on live nodes).
+                # Force-delete pods before removing their nodes. The fake
+                # apiserver deletes immediately (no finalizers, no real
+                # kubelet to wait on), so this settles fast; still confirmed
+                # via _wait_for_pods_gone rather than assumed.
                 yield from _create_all(lambda name: client.delete_pod(namespace, name),
                                        expected, "deleting pods")
                 yield from _wait_for_pods_gone(client, namespace, timeout)
@@ -163,8 +166,9 @@ def run(client, config, timeout=30, keep=False):
                                                 "deleting namespace")
                 yield from _create_all(client.delete_node, created_nodes, "deleting nodes")
             except KubeError as e:
-                # etcd lives in the container, so only a rebuild is a
-                # guaranteed reset -- a restart keeps the leftovers.
+                # The fake apiserver's store is in-memory for the life of the
+                # container, so only a rebuild (`down` then `up`) is a
+                # guaranteed reset -- a plain restart keeps the leftovers.
                 yield {"phase": "warning",
                        "message": f"cleanup incomplete ({e}); reset with: "
                                   f"python3 -m schedsim down && python3 -m schedsim up"}
@@ -172,6 +176,10 @@ def run(client, config, timeout=30, keep=False):
 
 
 def _wait_for_nodes_ready(client, names, timeout):
+    # The fake apiserver marks every node Ready the instant it's created
+    # (server/fakeapi.py), so in practice this returns on the first poll;
+    # it stays a poll rather than a flat assertion so a slow apiserver
+    # write path degrades gracefully instead of racing it.
     deadline = time.time() + timeout
     names = set(names)
     while time.time() < deadline:
@@ -181,16 +189,10 @@ def _wait_for_nodes_ready(client, names, timeout):
                 if cond["type"] == "Ready" and cond["status"] == "True":
                     ready.add(node["metadata"]["name"])
         if names <= ready:
-            # The TaintNodesByCondition admission plugin taints new nodes
-            # not-ready; with no kube-controller-manager running, nothing
-            # removes it, so do the node lifecycle controller's job here.
-            for name in sorted(names):
-                client.patch(f"/api/v1/nodes/{name}",
-                             {"spec": {"taints": [KWOK_TAINT]}})
             return
         time.sleep(0.5)
     raise SimError(f"nodes never became Ready: {sorted(names - ready)} "
-                   "(is the kwok controller running? podman logs schedsim)")
+                   "(check: podman logs schedsim)")
 
 
 def _wait_for_pods_gone(client, namespace, timeout):

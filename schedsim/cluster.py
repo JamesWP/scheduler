@@ -41,7 +41,7 @@ def up(wait_seconds=90):
     else:
         _podman("rm", "-f", CONTAINER, check=False)
         _podman("run", "-d", "--name", CONTAINER,
-               "-p", "6443:6443", "-p", "8080:8080", IMAGE)
+               "-p", "8080:8080", IMAGE)
     print("waiting for control plane...", file=sys.stderr)
     deadline = time.time() + wait_seconds
     while time.time() < deadline:

@@ -1,7 +1,12 @@
-"""Minimal Kubernetes apiserver REST client (stdlib only)."""
+"""Minimal Kubernetes apiserver REST client (stdlib only).
+
+Talks to the fake apiserver (fakeapi.py) mounted in this same process --
+plain HTTP on localhost, no TLS to set up and nothing enforcing the bearer
+token, but it's still sent so a `podman exec ... kubectl` using the same
+kubeconfig looks like a normal authenticated client.
+"""
 
 import json
-import ssl
 import urllib.error
 import urllib.request
 
@@ -13,12 +18,9 @@ class KubeError(Exception):
 
 
 class KubeClient:
-    def __init__(self, server="https://127.0.0.1:6443", token=TOKEN):
+    def __init__(self, server="http://127.0.0.1:8080", token=TOKEN):
         self.server = server.rstrip("/")
         self.token = token
-        self.ctx = ssl.create_default_context()
-        self.ctx.check_hostname = False
-        self.ctx.verify_mode = ssl.CERT_NONE
 
     def request(self, method, path, body=None, timeout=10):
         req = urllib.request.Request(self.server + path, method=method)
@@ -30,8 +32,7 @@ class KubeClient:
                            "application/merge-patch+json" if method == "PATCH"
                            else "application/json")
         try:
-            with urllib.request.urlopen(req, data=data, context=self.ctx,
-                                        timeout=timeout) as resp:
+            with urllib.request.urlopen(req, data=data, timeout=timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")

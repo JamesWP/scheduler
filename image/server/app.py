@@ -6,6 +6,11 @@ or {"phase": "error", ...} line. The whole request stays open for the run's
 full duration; there is no separate job id to reconnect to, so a client
 disconnect aborts the run (the in-progress `finally` cleanup in simulate.run
 still executes locally even though the write back to the client will fail).
+
+This same app also serves the fake Kubernetes API (fakeapi.py) that stands
+in for etcd + kube-apiserver + kube-controller-manager + kwok -- one process
+is both "the cluster" that the unmodified kube-scheduler binary talks to and
+the thing driving simulations against it.
 """
 
 import json
@@ -14,10 +19,11 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import simulate
+from . import fakeapi, simulate
 from .kube import KubeClient, KubeError
 
 app = FastAPI()
+app.include_router(fakeapi.router)
 
 
 class RunRequest(BaseModel):
