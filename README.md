@@ -165,14 +165,20 @@ simulations against it:
   kube-scheduler and kubectl processes go through the HTTP router.
   `app.py` wires `POST /run` to `simulate.run()`.
 
-Two things that only showed up testing against the real kube-scheduler
+Three things that only showed up testing against the real kube-scheduler
 binary, not visible from the API shape alone: it defaults to sending
 POST/PUT bodies (including the bind call) as protobuf, not JSON, so
 `entrypoint.sh` passes `--kube-api-content-type=application/json` --
-a standard client-go flag, not a binary patch; and the real apiserver
+a standard client-go flag, not a binary patch; the real apiserver
 defaults an unset `pod.spec.schedulerName` to `"default-scheduler"` on
 create, which `fakeapi.py`'s pod-creation hook now does too, since a
-scheduler silently ignores any pod addressed to a different name.
+scheduler silently ignores any pod addressed to a different name; and
+its default client-side rate limit (`--kube-api-qps=50
+--kube-api-burst=100`) exists to protect a *real* apiserver, which this
+one doesn't need protecting from -- at the default rate a several-
+thousand-pod scenario spends most of its wall time just waiting on its
+own throttling, so `entrypoint.sh` raises both well past anything this
+simulator would ever need.
 
 The `POST /run` flow itself:
 

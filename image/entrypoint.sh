@@ -39,10 +39,20 @@ echo "fake apiserver ready"
 # doesn't decode. This flag is a standard, documented client-go setting --
 # it doesn't touch the binary -- that gets the scheduler to speak the JSON
 # this fake apiserver actually understands.
+#
+# --kube-api-qps/--kube-api-burst: the client-go defaults (50/100) exist to
+# protect a *real* apiserver from an overeager scheduler; this fake one is
+# just in-memory dict writes, nothing to protect. At the default rate a
+# few-thousand-pod scenario spends most of its wall time sitting in
+# client-side throttling (verified: one 500-node/3693-pod run went from
+# ~70s to ~4s after raising these) -- so raise them well past anything a
+# scenario here would ever need.
 kube-scheduler \
   --kubeconfig="$KUBECONFIG_PATH" \
   --leader-elect=false \
   --kube-api-content-type=application/json \
+  --kube-api-qps=1000 \
+  --kube-api-burst=2000 \
   >/var/log/kube-scheduler.log 2>&1 &
 
 echo "schedsim control plane up (fake apiserver, run API, kube-scheduler)"
