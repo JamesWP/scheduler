@@ -3,13 +3,16 @@
 Answers "given these nodes and these workloads, where would the **real**
 Kubernetes scheduler place things?" without a real cluster.
 
-A single container (run via podman) bundles etcd, kube-apiserver,
-kube-scheduler, kube-controller-manager (namespace + GC controllers only), the
-[KWOK](https://kwok.sigs.k8s.io/) controller (which fakes kubelets so nodes go
-Ready and pods run without any real workloads), and a small FastAPI service
-that drives the whole simulation. The `schedsim` Python CLI is presentation
-only: it parses the input file, POSTs it to that in-container API, and
-renders the streamed progress and final allocation.
+A single container (run via podman) bundles the unmodified upstream
+kube-scheduler binary with a small FastAPI service that is *both* the thing
+driving the simulation *and* a fake, in-memory Kubernetes API server
+standing in for etcd, kube-apiserver, kube-controller-manager, and the
+[KWOK](https://kwok.sigs.k8s.io/) controller (which those used to need to
+fake kubelets so nodes went Ready and pods "ran" without any real
+workloads) — the fake apiserver just marks nodes Ready and binds pods
+directly, no separate controller needed. The `schedsim` Python CLI is
+presentation only: it parses the input file, POSTs it to that in-container
+API, and renders the streamed progress and final allocation.
 
 ## Quick start
 
@@ -22,7 +25,7 @@ Requires: podman, python3, PyYAML (`pip install pyyaml`; JSON input works withou
 ## Usage
 
 ```bash
-python3 -m schedsim up                # start the control plane (localhost:6443, API on :8080)
+python3 -m schedsim up                # start the control plane (fake apiserver + run API on :8080)
 python3 -m schedsim gen -o input.yaml # synthesise a scenario (see below)
 python3 -m schedsim run input.yaml    # schedule and print a summary
 python3 -m schedsim down              # tear down
@@ -41,8 +44,10 @@ nodes/pods, scheduling, and the deletion/cleanup that follows — streams live
 progress to stderr for the whole run, not just the first half.
 
 If a run is interrupted, its nodes are left behind and the next run fails
-with `already exists`. etcd lives inside the container, so a restart keeps
-them — reset with `python3 -m schedsim down && python3 -m schedsim up`.
+with `already exists`. The fake apiserver's object store is in-memory and
+only lives as long as the container, but a container *restart* (as opposed
+to `down`/`up`, which replaces it) keeps them — reset with
+`python3 -m schedsim down && python3 -m schedsim up`.
 
 ## Input format
 
@@ -64,7 +69,7 @@ workloads:
 
 Raw Kubernetes manifests also work: any entry with `kind: Node` /
 `kind: Pod` is passed through untouched (pods must tolerate the
-`kwok.x-k8s.io/node=fake:NoSchedule` taint).
+`schedsim.local/fake-node=true:NoSchedule` taint).
 
 Example output:
 
@@ -129,22 +134,65 @@ kubectl ships inside the image; the host needs nothing:
 podman exec -it schedsim kubectl get nodes,pods -A -o wide
 ```
 
-Or hit the k8s API from the host: `https://127.0.0.1:6443` with bearer token
-`schedsim-token` (self-signed cert — this is a local sim, auth is a formality).
-The run API itself is unauthenticated plain HTTP on `:8080` — same trust
-level as the podman socket that already controls the container.
+Or hit the k8s API from the host directly: `http://127.0.0.1:8080` — plain
+HTTP, and unauthenticated in practice (the fake apiserver accepts any bearer
+token, same `AlwaysAllow` spirit a real apiserver would run this sim under).
+It's the same port and the same process as the run API — same trust level
+as the podman socket that already controls the container.
 
 ## How it works
 
-The core logic (`image/server/`) runs *inside* the container as a FastAPI
-service, since it's the one place that can talk to the local apiserver
-directly; the host-side `schedsim` CLI never speaks raw Kubernetes REST.
+The core logic (`image/server/`) runs *inside* the container as a single
+FastAPI service that is both "the cluster" and the thing driving
+simulations against it, split across three modules by responsibility:
+
+- `store.py` is a fake, in-memory Kubernetes object store: plain dicts and
+  a resourceVersion counter, importable and testable on its own. It only
+  gives real CRUD/patch/watch to the three resource types anything
+  actually writes to — Nodes, Namespaces, Pods. There's no etcd, no real
+  kube-apiserver, no kube-controller-manager, and no KWOK controller:
+  `store.py` marks nodes Ready and cascades a namespace delete to
+  everything in it itself, synchronously, as part of handling the write
+  (standing in for the node-lifecycle and namespace controllers).
+  Everything else the scheduler's informers watch on startup but this
+  simulator never populates (PVs, PVCs, StorageClasses, CSI objects,
+  Services, controllers, PDBs) is just served as a permanently-empty,
+  watchable collection — enough for an informer to sync against, nothing
+  more. Watching is a plain synchronous callback list (`Store.watch`):
+  `publish()` calls each registered callback directly; arranging thread
+  safety for a particular caller (fakeapi.py's watch streams, since
+  `publish()` can be called from a worker thread) is that caller's job.
+- `fakeapi.py` is the HTTP layer: a FastAPI router, mounted into the same
+  app as `POST /run`, that speaks the REST/watch surface an unmodified
+  kube-scheduler binary and kubectl actually expect — parsing requests,
+  calling into `store.py`, shaping responses.
+- `simulate.py` calls `store.py` directly — plain Python function calls,
+  since they run in the same process; the external kube-scheduler and
+  kubectl processes go through `fakeapi.py`'s router instead, since a
+  separate OS process has no other way in. `app.py` wires `POST /run` to
+  `simulate.run()`.
+
+Three things that only showed up testing against the real kube-scheduler
+binary, not visible from the API shape alone: it defaults to sending
+POST/PUT bodies (including the bind call) as protobuf, not JSON, so
+`entrypoint.sh` passes `--kube-api-content-type=application/json` --
+a standard client-go flag, not a binary patch; the real apiserver
+defaults an unset `pod.spec.schedulerName` to `"default-scheduler"` on
+create, which `store.py`'s pod-creation hook now does too, since a
+scheduler silently ignores any pod addressed to a different name; and
+its default client-side rate limit (`--kube-api-qps=50
+--kube-api-burst=100`) exists to protect a *real* apiserver, which this
+one doesn't need protecting from -- at the default rate a several-
+thousand-pod scenario spends most of its wall time just waiting on its
+own throttling, so `entrypoint.sh` raises both well past anything this
+simulator would ever need.
+
+The `POST /run` flow itself:
 
 1. The CLI POSTs the parsed input to `POST /run`; the server creates a
-   throwaway namespace, then Node objects annotated `kwok.x-k8s.io/node:
-   fake` — the KWOK controller adopts them and marks them Ready (the server
-   then strips the `not-ready` admission taint, standing in for the node
-   lifecycle controller, which isn't running).
+   throwaway namespace, then Node objects tainted
+   `schedsim.local/fake-node=true:NoSchedule` — the fake apiserver marks them
+   Ready as part of handling the create, no separate controller involved.
 2. Workloads become Pods (replicas expanded to `name-0..n`) with resource
    requests; the untouched upstream kube-scheduler binds them.
 3. The server polls until every pod is bound or unschedulable, streaming
@@ -154,8 +202,7 @@ directly; the host-side `schedsim` CLI never speaks raw Kubernetes REST.
 4. The CLI renders each event as it arrives and, once `rows` shows up, prints
    the summary (or writes `--csv`/`--json`).
 
-Component versions are pinned in `image/Dockerfile` (k8s v1.31.4,
-etcd v3.5.17, kwok v0.6.1).
+The kube-scheduler version is pinned in `image/Dockerfile` (v1.31.4).
 
 ## License
 

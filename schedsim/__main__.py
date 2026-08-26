@@ -101,7 +101,7 @@ def main():
 
     if args.command == "up":
         cluster.up()
-        print("control plane ready at https://127.0.0.1:6443")
+        print("control plane ready at http://127.0.0.1:8080")
     elif args.command == "down":
         cluster.down()
         print("removed")

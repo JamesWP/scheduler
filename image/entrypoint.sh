@@ -1,125 +1,61 @@
 #!/bin/bash
-# Starts etcd, kube-apiserver, kube-scheduler and the kwok controller in one
-# container. Exits if any component dies.
+# Starts the fake control plane (server/app.py: the run API plus the fake
+# apiserver that stands in for etcd + kube-apiserver + kube-controller-manager
+# + kwok) and the unmodified upstream kube-scheduler in one container. Exits
+# if either dies.
 set -euo pipefail
 
-PKI=/etc/kubernetes/pki
 KUBECONFIG_PATH=/etc/kubernetes/admin.kubeconfig
-TOKEN=schedsim-token
-mkdir -p "$PKI" /var/lib/etcd
+mkdir -p /etc/kubernetes
 
-# --- certs -------------------------------------------------------------------
-if [ ! -f "$PKI/apiserver.crt" ]; then
-  openssl genrsa -out "$PKI/ca.key" 2048 >/dev/null 2>&1
-  openssl req -x509 -new -nodes -key "$PKI/ca.key" -subj "/CN=schedsim-ca" \
-    -days 3650 -out "$PKI/ca.crt" >/dev/null 2>&1
-
-  openssl genrsa -out "$PKI/apiserver.key" 2048 >/dev/null 2>&1
-  cat > "$PKI/apiserver.cnf" <<'EOF'
-[req]
-distinguished_name = dn
-req_extensions = ext
-[dn]
-[ext]
-subjectAltName = DNS:localhost,DNS:kubernetes,DNS:kubernetes.default,IP:127.0.0.1,IP:10.96.0.1
-EOF
-  openssl req -new -key "$PKI/apiserver.key" -subj "/CN=kube-apiserver" \
-    -config "$PKI/apiserver.cnf" -out "$PKI/apiserver.csr" >/dev/null 2>&1
-  openssl x509 -req -in "$PKI/apiserver.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
-    -CAcreateserial -days 3650 -extensions ext -extfile "$PKI/apiserver.cnf" \
-    -out "$PKI/apiserver.crt" >/dev/null 2>&1
-
-  # Service-account signing key (required by the apiserver even if unused).
-  openssl genrsa -out "$PKI/sa.key" 2048 >/dev/null 2>&1
-  openssl rsa -in "$PKI/sa.key" -pubout -out "$PKI/sa.pub" >/dev/null 2>&1
-
-  echo "$TOKEN,admin,admin,system:masters" > /etc/kubernetes/tokens.csv
-fi
-
-# --- kubeconfig --------------------------------------------------------------
-kubectl config set-cluster schedsim --server=https://127.0.0.1:6443 \
-  --certificate-authority="$PKI/ca.crt" --embed-certs=true \
+# --- kubeconfig ----------------------------------------------------------
+# Plain HTTP, no cert to generate: the fake apiserver doesn't enforce auth
+# (same AlwaysAllow spirit the real one used to run with here), it just
+# accepts a bearer token for realism. Points at the same process/port the
+# run API listens on -- there's no separate apiserver to dial.
+kubectl config set-cluster schedsim --server=http://127.0.0.1:8080 \
   --kubeconfig="$KUBECONFIG_PATH" >/dev/null
-kubectl config set-credentials admin --token="$TOKEN" --kubeconfig="$KUBECONFIG_PATH" >/dev/null
+kubectl config set-credentials admin --token=schedsim-token --kubeconfig="$KUBECONFIG_PATH" >/dev/null
 kubectl config set-context default --cluster=schedsim --user=admin --kubeconfig="$KUBECONFIG_PATH" >/dev/null
 kubectl config use-context default --kubeconfig="$KUBECONFIG_PATH" >/dev/null
 mkdir -p /root/.kube && cp "$KUBECONFIG_PATH" /root/.kube/config
 export KUBECONFIG="$KUBECONFIG_PATH"
 
-# --- etcd --------------------------------------------------------------------
-etcd --data-dir=/var/lib/etcd \
-  --listen-client-urls=http://127.0.0.1:2379 \
-  --advertise-client-urls=http://127.0.0.1:2379 \
-  --listen-peer-urls=http://127.0.0.1:2380 \
-  >/var/log/etcd.log 2>&1 &
+# --- fake control plane + run API (server/app.py, mounts fakeapi.py) -----
+(cd /opt/schedsim && uvicorn server.app:app --host 0.0.0.0 --port 8080) \
+  >/var/log/schedsim-api.log 2>&1 &
 
-# --- kube-apiserver ----------------------------------------------------------
-kube-apiserver \
-  --etcd-servers=http://127.0.0.1:2379 \
-  --secure-port=6443 \
-  --bind-address=0.0.0.0 \
-  --tls-cert-file="$PKI/apiserver.crt" \
-  --tls-private-key-file="$PKI/apiserver.key" \
-  --client-ca-file="$PKI/ca.crt" \
-  --token-auth-file=/etc/kubernetes/tokens.csv \
-  --authorization-mode=AlwaysAllow \
-  --service-account-key-file="$PKI/sa.pub" \
-  --service-account-signing-key-file="$PKI/sa.key" \
-  --service-account-issuer=https://kubernetes.default.svc \
-  --service-cluster-ip-range=10.96.0.0/16 \
-  --disable-admission-plugins=ServiceAccount \
-  >/var/log/kube-apiserver.log 2>&1 &
-
-echo "waiting for apiserver..."
-for i in $(seq 1 60); do
+echo "waiting for fake apiserver..."
+for i in $(seq 1 30); do
   kubectl get --raw /readyz >/dev/null 2>&1 && break
   sleep 1
-  [ "$i" = 60 ] && { echo "apiserver never became ready"; cat /var/log/kube-apiserver.log; exit 1; }
+  [ "$i" = 30 ] && { echo "fake apiserver never became ready"; cat /var/log/schedsim-api.log; exit 1; }
 done
-echo "apiserver ready"
+echo "fake apiserver ready"
 
-# --- kube-scheduler ----------------------------------------------------------
-# --kube-api-qps/--kube-api-burst: client-go's defaults (50/100) are sized
-# for a scheduler sharing a large production cluster's apiserver with many
-# other clients; here it's the only writer against a private, otherwise-idle
-# etcd+apiserver on loopback, so raise them well past anything a scenario
-# here would need. At the default rate a several-thousand-pod scenario
-# spends most of its wall time sitting in client-side throttling rather
-# than doing anything -- verified on the equivalent fake-apiserver stack (the
-# claude/fake-k8s-server-schedctl-0y90nt branch): a 500-node/3693-pod run
-# went from ~70s to ~4s after raising these, same result.
+# --- kube-scheduler (unmodified upstream binary) --------------------------
+# --kube-api-content-type=json: kube-scheduler's client defaults to sending
+# protobuf-encoded request bodies (POST/PUT), which this fake apiserver
+# doesn't decode. This flag is a standard, documented client-go setting --
+# it doesn't touch the binary -- that gets the scheduler to speak the JSON
+# this fake apiserver actually understands.
+#
+# --kube-api-qps/--kube-api-burst: the client-go defaults (50/100) exist to
+# protect a *real* apiserver from an overeager scheduler; this fake one is
+# just in-memory dict writes, nothing to protect. At the default rate a
+# few-thousand-pod scenario spends most of its wall time sitting in
+# client-side throttling (verified: one 500-node/3693-pod run went from
+# ~70s to ~4s after raising these) -- so raise them well past anything a
+# scenario here would ever need.
 kube-scheduler \
   --kubeconfig="$KUBECONFIG_PATH" \
   --leader-elect=false \
+  --kube-api-content-type=application/json \
   --kube-api-qps=1000 \
   --kube-api-burst=2000 \
   >/var/log/kube-scheduler.log 2>&1 &
 
-# --- kube-controller-manager (namespace + GC only, so deletions complete) ---
-kube-controller-manager \
-  --kubeconfig="$KUBECONFIG_PATH" \
-  --controllers=namespace-controller,garbage-collector-controller \
-  --leader-elect=false \
-  >/var/log/kube-controller-manager.log 2>&1 &
-
-# --- kwok controller ---------------------------------------------------------
-KWOK_STAGE_ARGS=()
-for f in /etc/kwok/stages/*.yaml; do
-  KWOK_STAGE_ARGS+=(--config="$f")
-done
-kwok \
-  --kubeconfig="$KUBECONFIG_PATH" \
-  --manage-all-nodes=true \
-  --node-ip=10.0.0.1 \
-  --cidr=10.0.0.0/24 \
-  "${KWOK_STAGE_ARGS[@]}" \
-  >/var/log/kwok.log 2>&1 &
-
-# --- schedsim run API ---------------------------------------------------
-(cd /opt/schedsim && uvicorn server.app:app --host 0.0.0.0 --port 8080) \
-  >/var/log/schedsim-api.log 2>&1 &
-
-echo "schedsim control plane up (etcd, kube-apiserver, kube-scheduler, kwok, run API)"
+echo "schedsim control plane up (fake apiserver, run API, kube-scheduler)"
 
 # Exit when any component exits, so the container fails loudly.
 wait -n
