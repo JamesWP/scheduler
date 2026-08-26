@@ -1,10 +1,11 @@
 """Turn a simplified nodes/workloads spec into k8s objects, schedule, report.
 
 Runs inside the control-plane container, in the same process as the fake
-apiserver (fakeapi.py) -- so the writes and polling *this* module does go
+object store (store.py) -- so the writes and polling *this* module does go
 straight into its in-memory store as plain Python calls, no HTTP hop, no
-network failure modes to handle. The only thing that talks to fakeapi.py
-over real HTTP is the external kube-scheduler binary, a separate OS
+network failure modes to handle, and no dependency on the HTTP layer
+(fakeapi.py) at all. The only thing that talks to store.py over real HTTP
+is the external kube-scheduler binary, via fakeapi.py, a separate OS
 process that has no other way in.
 
 Every long-running step is a generator that `yield`s progress dicts instead
@@ -15,7 +16,7 @@ which is what actually renders them.
 import time
 import uuid
 
-from . import fakeapi
+from . import store
 
 # Nodes are tainted so only pods that explicitly tolerate "the scheduler's
 # playground isn't a real, workload-bearing node" land on them -- a real
@@ -106,7 +107,7 @@ def run(config, timeout=30, keep=False):
     or {"phase": "error", "message": ...}.
     """
     namespace = "sim-" + uuid.uuid4().hex[:8]
-    fakeapi.create_namespace(namespace)
+    store.create_namespace(namespace)
     created_nodes = []
     expected = []
     rows = []
@@ -115,8 +116,8 @@ def run(config, timeout=30, keep=False):
                       else node_manifest(n) for n in config.get("nodes", [])]
         created_nodes = [n["metadata"]["name"] for n in node_specs]
         try:
-            yield from _apply_all(fakeapi.create_node, node_specs, "creating nodes")
-        except fakeapi.AlreadyExists as e:
+            yield from _apply_all(store.create_node, node_specs, "creating nodes")
+        except store.AlreadyExists as e:
             created_nodes = []  # don't delete nodes this run didn't create
             raise SimError(
                 f"{e}\nnodes from an earlier run are still in the cluster; "
@@ -130,7 +131,7 @@ def run(config, timeout=30, keep=False):
             else:
                 pods.extend(pod_manifests(workload))
         expected = [p["metadata"]["name"] for p in pods]
-        yield from _apply_all(lambda pod: fakeapi.create_pod(namespace, pod), pods, "creating pods")
+        yield from _apply_all(lambda pod: store.create_pod(namespace, pod), pods, "creating pods")
 
         rows = yield from _wait_for_scheduling(namespace, expected, timeout)
     finally:
@@ -141,22 +142,22 @@ def run(config, timeout=30, keep=False):
             # real kubelet to wait on) and mutating its in-memory store
             # can't fail the way a real network call could -- so cleanup is
             # just three plain loops, nothing to retry or warn about.
-            yield from _apply_all(lambda name: fakeapi.delete_pod(namespace, name),
+            yield from _apply_all(lambda name: store.delete_pod(namespace, name),
                                   expected, "deleting pods")
-            fakeapi.delete_namespace(namespace)
-            yield from _apply_all(fakeapi.delete_node, created_nodes, "deleting nodes")
+            store.delete_namespace(namespace)
+            yield from _apply_all(store.delete_node, created_nodes, "deleting nodes")
     yield {"phase": "done", "rows": rows}
 
 
 def _wait_for_nodes_ready(names, timeout):
     # The fake apiserver marks every node Ready as part of handling the
-    # create (server/fakeapi.py), so in practice this returns on the first
+    # create (server/store.py), so in practice this returns on the first
     # check; it stays a poll rather than a flat assertion so a future,
     # slower write path would degrade gracefully instead of racing it.
     deadline = time.time() + timeout
     names = set(names)
     while time.time() < deadline:
-        ready = {n["metadata"]["name"] for n in fakeapi.list_nodes()
+        ready = {n["metadata"]["name"] for n in store.list_nodes()
                  if any(c["type"] == "Ready" and c["status"] == "True"
                         for c in n.get("status", {}).get("conditions", []))}
         if names <= ready:
@@ -181,7 +182,7 @@ def _wait_for_scheduling(namespace, expected, timeout):
     while time.time() < deadline:
         rows = {}
         settled = True
-        for pod in fakeapi.list_pods(namespace):
+        for pod in store.list_pods(namespace):
             name = pod["metadata"]["name"]
             node = pod["spec"].get("nodeName")
             if node:

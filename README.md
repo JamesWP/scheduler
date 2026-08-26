@@ -144,25 +144,34 @@ as the podman socket that already controls the container.
 
 The core logic (`image/server/`) runs *inside* the container as a single
 FastAPI service that is both "the cluster" and the thing driving
-simulations against it:
+simulations against it, split across three modules by what actually needs
+an HTTP framework and what doesn't:
 
-- `fakeapi.py` is a fake, in-memory Kubernetes API server: an in-memory
-  store plus a FastAPI router mounted into the same app as `POST /run`.
-  It only gives real CRUD/patch/watch to the three resource types anything
-  actually writes to — Nodes, Namespaces, Pods (the *only* other thing left
-  in the image is the unmodified upstream kube-scheduler binary, talking to
-  these over plain HTTP exactly as it would to a real apiserver). There's
-  no etcd, no real kube-apiserver, no kube-controller-manager, and no KWOK
-  controller: `fakeapi.py` marks nodes Ready and cascades a namespace
+- `store.py` is a fake, in-memory Kubernetes object store: no FastAPI, no
+  asyncio, no I/O of any kind -- plain dicts and stdlib, importable and
+  testable on its own. It only gives real CRUD/patch/watch to the three
+  resource types anything actually writes to — Nodes, Namespaces, Pods.
+  There's no etcd, no real kube-apiserver, no kube-controller-manager, and
+  no KWOK controller: `store.py` marks nodes Ready and cascades a namespace
   delete to everything in it itself, synchronously, as part of handling the
   write (standing in for the node-lifecycle and namespace controllers).
   Everything else the scheduler's informers watch on startup but this
   simulator never populates (PVs, PVCs, StorageClasses, CSI objects,
   Services, controllers, PDBs) is just served as a permanently-empty,
-  watchable collection — enough for an informer to sync against, nothing more.
-- `simulate.py` calls `fakeapi.py`'s store directly — plain Python function
-  calls, not HTTP — since they run in the same process; only the external
-  kube-scheduler and kubectl processes go through the HTTP router.
+  watchable collection — enough for an informer to sync against, nothing
+  more. Watching is a plain synchronous callback list (`Store.watch`);
+  `store.py` has no opinion about threads or event loops, that's entirely
+  the caller's problem.
+- `fakeapi.py` is the HTTP layer: a FastAPI router, mounted into the same
+  app as `POST /run`, that speaks the REST/watch surface an unmodified
+  kube-scheduler binary and kubectl actually expect — parsing requests,
+  calling into `store.py`, shaping responses. It's the *only* place that
+  imports FastAPI/Starlette; everything it does is translation, none of it
+  is "what a Pod is."
+- `simulate.py` calls `store.py` directly — plain Python function calls,
+  not HTTP — since they run in the same process and it has no reason to
+  go through an HTTP layer to talk to itself; only the external
+  kube-scheduler and kubectl processes go through `fakeapi.py`'s router.
   `app.py` wires `POST /run` to `simulate.run()`.
 
 Three things that only showed up testing against the real kube-scheduler
@@ -171,7 +180,7 @@ POST/PUT bodies (including the bind call) as protobuf, not JSON, so
 `entrypoint.sh` passes `--kube-api-content-type=application/json` --
 a standard client-go flag, not a binary patch; the real apiserver
 defaults an unset `pod.spec.schedulerName` to `"default-scheduler"` on
-create, which `fakeapi.py`'s pod-creation hook now does too, since a
+create, which `store.py`'s pod-creation hook now does too, since a
 scheduler silently ignores any pod addressed to a different name; and
 its default client-side rate limit (`--kube-api-qps=50
 --kube-api-burst=100`) exists to protect a *real* apiserver, which this

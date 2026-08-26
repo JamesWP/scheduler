@@ -7,17 +7,16 @@ full duration; there is no separate job id to reconnect to, so a client
 disconnect aborts the run (the in-progress `finally` cleanup in simulate.run
 still executes locally even though the write back to the client will fail).
 
-This same app also serves the fake Kubernetes API (fakeapi.py) that stands
-in for etcd + kube-apiserver + kube-controller-manager + kwok -- one process
-is both "the cluster" that the unmodified kube-scheduler binary talks to and
-the thing driving simulations against it. simulate.py calls fakeapi.py
-directly (no HTTP, they're the same process); only the external
-kube-scheduler and kubectl processes go through the router below.
+This same app also serves the fake Kubernetes API: fakeapi.py is the HTTP
+layer, store.py underneath it is the actual in-memory object store, and
+together they stand in for etcd + kube-apiserver + kube-controller-manager
++ kwok. One process is both "the cluster" that the unmodified kube-scheduler
+binary talks to and the thing driving simulations against it: simulate.py
+calls store.py directly (no HTTP, they're the same process); only the
+external kube-scheduler and kubectl processes go through fakeapi.py's router.
 """
 
-import asyncio
 import json
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -25,17 +24,7 @@ from pydantic import BaseModel
 
 from . import fakeapi, simulate
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # simulate.py writes to fakeapi.STORE from a worker thread (see /run
-    # below), but its watch queues belong to this event loop; publish()
-    # needs the loop handle to hand cross-thread notifications to it safely.
-    fakeapi.STORE.set_loop(asyncio.get_running_loop())
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 app.include_router(fakeapi.router)
 
 
