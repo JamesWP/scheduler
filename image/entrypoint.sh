@@ -79,9 +79,20 @@ done
 echo "apiserver ready"
 
 # --- kube-scheduler ----------------------------------------------------------
+# --kube-api-qps/--kube-api-burst: client-go's defaults (50/100) are sized
+# for a scheduler sharing a large production cluster's apiserver with many
+# other clients; here it's the only writer against a private, otherwise-idle
+# etcd+apiserver on loopback, so raise them well past anything a scenario
+# here would need. At the default rate a several-thousand-pod scenario
+# spends most of its wall time sitting in client-side throttling rather
+# than doing anything -- verified on the equivalent fake-apiserver stack (the
+# claude/fake-k8s-server-schedctl-0y90nt branch): a 500-node/3693-pod run
+# went from ~70s to ~4s after raising these, same result.
 kube-scheduler \
   --kubeconfig="$KUBECONFIG_PATH" \
   --leader-elect=false \
+  --kube-api-qps=1000 \
+  --kube-api-burst=2000 \
   >/var/log/kube-scheduler.log 2>&1 &
 
 # --- kube-controller-manager (namespace + GC only, so deletions complete) ---
