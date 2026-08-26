@@ -144,35 +144,33 @@ as the podman socket that already controls the container.
 
 The core logic (`image/server/`) runs *inside* the container as a single
 FastAPI service that is both "the cluster" and the thing driving
-simulations against it, split across three modules by what actually needs
-an HTTP framework and what doesn't:
+simulations against it, split across three modules by responsibility:
 
-- `store.py` is a fake, in-memory Kubernetes object store: no FastAPI, no
-  asyncio, no I/O of any kind -- plain dicts and stdlib, importable and
-  testable on its own. It only gives real CRUD/patch/watch to the three
-  resource types anything actually writes to — Nodes, Namespaces, Pods.
-  There's no etcd, no real kube-apiserver, no kube-controller-manager, and
-  no KWOK controller: `store.py` marks nodes Ready and cascades a namespace
-  delete to everything in it itself, synchronously, as part of handling the
-  write (standing in for the node-lifecycle and namespace controllers).
+- `store.py` is a fake, in-memory Kubernetes object store: plain dicts and
+  a resourceVersion counter, importable and testable on its own. It only
+  gives real CRUD/patch/watch to the three resource types anything
+  actually writes to — Nodes, Namespaces, Pods. There's no etcd, no real
+  kube-apiserver, no kube-controller-manager, and no KWOK controller:
+  `store.py` marks nodes Ready and cascades a namespace delete to
+  everything in it itself, synchronously, as part of handling the write
+  (standing in for the node-lifecycle and namespace controllers).
   Everything else the scheduler's informers watch on startup but this
   simulator never populates (PVs, PVCs, StorageClasses, CSI objects,
   Services, controllers, PDBs) is just served as a permanently-empty,
   watchable collection — enough for an informer to sync against, nothing
-  more. Watching is a plain synchronous callback list (`Store.watch`);
-  `store.py` has no opinion about threads or event loops, that's entirely
-  the caller's problem.
+  more. Watching is a plain synchronous callback list (`Store.watch`):
+  `publish()` calls each registered callback directly; arranging thread
+  safety for a particular caller (fakeapi.py's watch streams, since
+  `publish()` can be called from a worker thread) is that caller's job.
 - `fakeapi.py` is the HTTP layer: a FastAPI router, mounted into the same
   app as `POST /run`, that speaks the REST/watch surface an unmodified
   kube-scheduler binary and kubectl actually expect — parsing requests,
-  calling into `store.py`, shaping responses. It's the *only* place that
-  imports FastAPI/Starlette; everything it does is translation, none of it
-  is "what a Pod is."
+  calling into `store.py`, shaping responses.
 - `simulate.py` calls `store.py` directly — plain Python function calls,
-  not HTTP — since they run in the same process and it has no reason to
-  go through an HTTP layer to talk to itself; only the external
-  kube-scheduler and kubectl processes go through `fakeapi.py`'s router.
-  `app.py` wires `POST /run` to `simulate.run()`.
+  since they run in the same process; the external kube-scheduler and
+  kubectl processes go through `fakeapi.py`'s router instead, since a
+  separate OS process has no other way in. `app.py` wires `POST /run` to
+  `simulate.run()`.
 
 Three things that only showed up testing against the real kube-scheduler
 binary, not visible from the API shape alone: it defaults to sending

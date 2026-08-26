@@ -1,14 +1,11 @@
-"""Pure in-memory Kubernetes-object store.
-
-No framework, no I/O, no threading/asyncio awareness -- just dicts, a few
-stdlib modules, and a synchronous callback-based watch mechanism. Nothing
-here knows this object store is served over HTTP, or that kube-scheduler
-is the one calling it; it's importable and unit-testable on its own.
+"""In-memory Kubernetes object store: plain dicts, a resourceVersion
+counter, and a synchronous callback-based watch mechanism. A
+self-contained module, safe to import and unit test on its own.
 
 Two things sit on top of this module: fakeapi.py (the HTTP layer, speaking
 the REST/watch surface kube-scheduler and kubectl actually expect) and
 simulate.py (schedsim's own driver, calling the functions below directly
-and in-process -- no HTTP hop for the data schedsim itself writes).
+and in-process).
 
 Resources split into two kinds:
 
@@ -42,11 +39,10 @@ class Store:
     resourceVersion counter across every resource type, same as real etcd.
 
     Watching is a plain synchronous callback list: publish() calls each
-    registered callback directly, on whatever thread called publish(). It
-    has no opinion about asyncio, threads, or event loops -- a caller that
-    needs this handed to an asyncio event loop safely (fakeapi.py's watch
-    streams, since publish() can come from a worker thread) wraps its own
-    callback accordingly; the store doesn't need to know that's happening.
+    registered callback directly, on whatever thread called publish().
+    Arranging thread safety for a particular caller (fakeapi.py's watch
+    streams hand callbacks off to an asyncio event loop, since publish()
+    can be called from a worker thread) is that caller's own job.
     """
 
     def __init__(self):

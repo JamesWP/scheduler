@@ -12,8 +12,8 @@ layer, store.py underneath it is the actual in-memory object store, and
 together they stand in for etcd + kube-apiserver + kube-controller-manager
 + kwok. One process is both "the cluster" that the unmodified kube-scheduler
 binary talks to and the thing driving simulations against it: simulate.py
-calls store.py directly (no HTTP, they're the same process); only the
-external kube-scheduler and kubectl processes go through fakeapi.py's router.
+calls store.py directly, since they're the same process; the external
+kube-scheduler and kubectl processes go through fakeapi.py's router instead.
 """
 
 import json
@@ -38,8 +38,8 @@ class RunRequest(BaseModel):
 
 @app.get("/healthz")
 def healthz():
-    # No separate apiserver process to check anymore -- being able to
-    # answer this request at all means the whole control plane is up.
+    # The fake apiserver runs in this same process, so answering this
+    # request at all means the whole control plane is up.
     return {"status": "ok"}
 
 

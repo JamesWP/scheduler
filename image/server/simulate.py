@@ -1,12 +1,10 @@
 """Turn a simplified nodes/workloads spec into k8s objects, schedule, report.
 
 Runs inside the control-plane container, in the same process as the fake
-object store (store.py) -- so the writes and polling *this* module does go
-straight into its in-memory store as plain Python calls, no HTTP hop, no
-network failure modes to handle, and no dependency on the HTTP layer
-(fakeapi.py) at all. The only thing that talks to store.py over real HTTP
-is the external kube-scheduler binary, via fakeapi.py, a separate OS
-process that has no other way in.
+object store (store.py), and calls it directly -- plain Python function
+calls for every write and poll this module does. The external
+kube-scheduler binary, a separate OS process, reaches that same store
+over real HTTP instead, through fakeapi.py.
 
 Every long-running step is a generator that `yield`s progress dicts instead
 of printing — the API layer (app.py) forwards those as NDJSON to the CLI,
@@ -32,8 +30,8 @@ def _apply_all(create, items, label, progress=True):
     """Run `create` over items, yielding progress dicts every 100 items.
 
     `label` is the full progress phrase, e.g. "creating nodes" or "deleting
-    pods". Each `create` is a plain in-memory dict write (no apiserver
-    round trip anymore), so this is just a loop -- no concurrency needed.
+    pods". Each `create` is a plain in-memory dict write, so a simple loop
+    keeps up fine -- no concurrency needed.
     """
     if not items:
         return
@@ -139,9 +137,7 @@ def run(config, timeout=30, keep=False):
             yield {"phase": "kept", "namespace": namespace}
         else:
             # The fake apiserver deletes synchronously (no finalizers, no
-            # real kubelet to wait on) and mutating its in-memory store
-            # can't fail the way a real network call could -- so cleanup is
-            # just three plain loops, nothing to retry or warn about.
+            # real kubelet to wait on), so cleanup is just three plain loops.
             yield from _apply_all(lambda name: store.delete_pod(namespace, name),
                                   expected, "deleting pods")
             store.delete_namespace(namespace)

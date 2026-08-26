@@ -4,14 +4,14 @@ Speaks just enough of the real REST/watch surface -- object CRUD, JSON
 [strategic-]merge/apply patch, list+watch, discovery, the pods/binding
 subresource -- for an unmodified kube-scheduler binary and kubectl to
 treat this like a real apiserver. Everything about *what* a Node/Pod/
-Namespace is, how creating or patching one behaves, and what's watchable
-lives in store.py, which has no idea this HTTP layer exists; this module
-only parses requests, calls into store.py, and shapes HTTP responses.
+Namespace is and how creating or patching one behaves lives in store.py;
+this module's job is parsing requests, calling into store.py, and shaping
+HTTP responses.
 
 Mounted as a router into the same FastAPI app as /run (server/app.py), so
 one process is both "the cluster" that the external kube-scheduler and
 kubectl processes talk to over real HTTP, and the thing driving
-simulations against it (simulate.py calls store.py directly, no HTTP hop).
+simulations against it (simulate.py calls store.py directly).
 """
 
 import asyncio
@@ -92,9 +92,9 @@ def readyz():
 
 async def _watch_stream(request, group, resource, namespace):
     """Works identically for a LIVE resource (real events flow through) and
-    a STUB one (store.py never publishes to those keys, so this just idles
-    on keepalives) -- store.py doesn't distinguish the two, only this
-    module's dispatch does.
+    a STUB one (nothing is ever published to those keys, so this just
+    idles on keepalives) -- LIVE and STUB are a distinction this module's
+    dispatch makes, not one store.py's watch/publish knows about.
     """
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
