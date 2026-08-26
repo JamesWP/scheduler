@@ -1,64 +1,50 @@
 """Turn a simplified nodes/workloads spec into k8s objects, schedule, report.
 
-Runs inside the control-plane container, talking to the local fake
-apiserver (fakeapi.py). Every long-running step is a generator that
-`yield`s progress dicts instead of printing — the API layer (app.py)
-forwards those as NDJSON to the CLI, which is what actually renders them.
+Runs inside the control-plane container, in the same process as the fake
+apiserver (fakeapi.py) -- so the writes and polling *this* module does go
+straight into its in-memory store as plain Python calls, no HTTP hop, no
+network failure modes to handle. The only thing that talks to fakeapi.py
+over real HTTP is the external kube-scheduler binary, a separate OS
+process that has no other way in.
+
+Every long-running step is a generator that `yield`s progress dicts instead
+of printing — the API layer (app.py) forwards those as NDJSON to the CLI,
+which is what actually renders them.
 """
 
-import concurrent.futures
 import time
 import uuid
 
-from .kube import KubeError
+from . import fakeapi
 
 # Nodes are tainted so only pods that explicitly tolerate "the scheduler's
 # playground isn't a real, workload-bearing node" land on them -- a real
 # taint would come from a real kubelet; here it's just bookkeeping.
 FAKE_NODE_TAINT = {"key": "schedsim.local/fake-node", "value": "true", "effect": "NoSchedule"}
 
-# Each object is a separate apiserver round trip (~25ms), so a few thousand
-# pods take a minute serially. The apiserver copes fine with a handful of
-# concurrent writers.
-WRITE_CONCURRENCY = 16
-
 
 class SimError(Exception):
     """A run-ending condition the caller should report, not a bug."""
 
 
-def _call_with_heartbeat(fn, label):
-    """Run a single blocking call on a thread, yielding elapsed time while it's in flight."""
-    with concurrent.futures.ThreadPoolExecutor(1) as pool:
-        future = pool.submit(fn)
-        started = time.time()
-        while True:
-            try:
-                result = future.result(timeout=1)
-                break
-            except concurrent.futures.TimeoutError:
-                yield {"phase": label, "elapsed": round(time.time() - started, 1)}
-        yield {"phase": label, "elapsed": round(time.time() - started, 1), "done": True}
-        return result
+def _apply_all(create, items, label, progress=True):
+    """Run `create` over items, yielding progress dicts every 100 items.
 
-
-def _create_all(create, items, label, progress=True):
-    """Run `create` over items concurrently, yielding progress dicts.
-
-    `label` is the full progress phrase, e.g. "creating nodes" or "deleting pods".
+    `label` is the full progress phrase, e.g. "creating nodes" or "deleting
+    pods". Each `create` is a plain in-memory dict write (no apiserver
+    round trip anymore), so this is just a loop -- no concurrency needed.
     """
     if not items:
         return
-    done = 0
     started = time.time()
-    with concurrent.futures.ThreadPoolExecutor(WRITE_CONCURRENCY) as pool:
-        for _ in pool.map(create, items):
-            done += 1
-            if progress and (done % 100 == 0 or done == len(items)):
-                event = {"phase": label, "done": done, "total": len(items)}
-                if done == len(items):
-                    event["elapsed"] = round(time.time() - started, 1)
-                yield event
+    total = len(items)
+    for done, item in enumerate(items, 1):
+        create(item)
+        if progress and (done % 100 == 0 or done == total):
+            event = {"phase": label, "done": done, "total": total}
+            if done == total:
+                event["elapsed"] = round(time.time() - started, 1)
+            yield event
 
 
 def node_manifest(spec):
@@ -113,31 +99,29 @@ def pod_manifests(spec):
     return pods
 
 
-def run(client, config, timeout=30, keep=False):
+def run(config, timeout=30, keep=False):
     """Apply nodes + workloads, wait for scheduling, yield progress and a final result.
 
     The last event is always either {"phase": "done", "rows": [...], "kept": bool}
     or {"phase": "error", "message": ...}.
     """
     namespace = "sim-" + uuid.uuid4().hex[:8]
-    client.create_namespace(namespace)
+    fakeapi.create_namespace(namespace)
     created_nodes = []
     expected = []
     rows = []
     try:
-        node_manifests = [n if n.get("kind") == "Node"  # raw manifest pass-through
-                          else node_manifest(n) for n in config.get("nodes", [])]
-        created_nodes = [n["metadata"]["name"] for n in node_manifests]
+        node_specs = [n if n.get("kind") == "Node"  # raw manifest pass-through
+                      else node_manifest(n) for n in config.get("nodes", [])]
+        created_nodes = [n["metadata"]["name"] for n in node_specs]
         try:
-            yield from _create_all(client.create_node, node_manifests, "creating nodes")
-        except KubeError as e:
-            if "already exists" not in str(e):
-                raise
+            yield from _apply_all(fakeapi.create_node, node_specs, "creating nodes")
+        except fakeapi.AlreadyExists as e:
             created_nodes = []  # don't delete nodes this run didn't create
             raise SimError(
                 f"{e}\nnodes from an earlier run are still in the cluster; "
                 f"reset with: python3 -m schedsim down && python3 -m schedsim up")
-        _wait_for_nodes_ready(client, created_nodes, timeout)
+        _wait_for_nodes_ready(created_nodes, timeout)
 
         pods = []
         for workload in config.get("workloads", []):
@@ -146,48 +130,35 @@ def run(client, config, timeout=30, keep=False):
             else:
                 pods.extend(pod_manifests(workload))
         expected = [p["metadata"]["name"] for p in pods]
-        yield from _create_all(lambda pod: client.create_pod(namespace, pod),
-                               pods, "creating pods")
+        yield from _apply_all(lambda pod: fakeapi.create_pod(namespace, pod), pods, "creating pods")
 
-        rows = yield from _wait_for_scheduling(client, namespace, expected, timeout)
+        rows = yield from _wait_for_scheduling(namespace, expected, timeout)
     finally:
         if keep:
             yield {"phase": "kept", "namespace": namespace}
         else:
-            try:
-                # Force-delete pods before removing their nodes. The fake
-                # apiserver deletes immediately (no finalizers, no real
-                # kubelet to wait on), so this settles fast; still confirmed
-                # via _wait_for_pods_gone rather than assumed.
-                yield from _create_all(lambda name: client.delete_pod(namespace, name),
-                                       expected, "deleting pods")
-                yield from _wait_for_pods_gone(client, namespace, timeout)
-                yield from _call_with_heartbeat(lambda: client.delete_namespace(namespace),
-                                                "deleting namespace")
-                yield from _create_all(client.delete_node, created_nodes, "deleting nodes")
-            except KubeError as e:
-                # The fake apiserver's store is in-memory for the life of the
-                # container, so only a rebuild (`down` then `up`) is a
-                # guaranteed reset -- a plain restart keeps the leftovers.
-                yield {"phase": "warning",
-                       "message": f"cleanup incomplete ({e}); reset with: "
-                                  f"python3 -m schedsim down && python3 -m schedsim up"}
+            # The fake apiserver deletes synchronously (no finalizers, no
+            # real kubelet to wait on) and mutating its in-memory store
+            # can't fail the way a real network call could -- so cleanup is
+            # just three plain loops, nothing to retry or warn about.
+            yield from _apply_all(lambda name: fakeapi.delete_pod(namespace, name),
+                                  expected, "deleting pods")
+            fakeapi.delete_namespace(namespace)
+            yield from _apply_all(fakeapi.delete_node, created_nodes, "deleting nodes")
     yield {"phase": "done", "rows": rows}
 
 
-def _wait_for_nodes_ready(client, names, timeout):
-    # The fake apiserver marks every node Ready the instant it's created
-    # (server/fakeapi.py), so in practice this returns on the first poll;
-    # it stays a poll rather than a flat assertion so a slow apiserver
-    # write path degrades gracefully instead of racing it.
+def _wait_for_nodes_ready(names, timeout):
+    # The fake apiserver marks every node Ready as part of handling the
+    # create (server/fakeapi.py), so in practice this returns on the first
+    # check; it stays a poll rather than a flat assertion so a future,
+    # slower write path would degrade gracefully instead of racing it.
     deadline = time.time() + timeout
     names = set(names)
     while time.time() < deadline:
-        ready = set()
-        for node in client.list_nodes():
-            for cond in node.get("status", {}).get("conditions", []):
-                if cond["type"] == "Ready" and cond["status"] == "True":
-                    ready.add(node["metadata"]["name"])
+        ready = {n["metadata"]["name"] for n in fakeapi.list_nodes()
+                 if any(c["type"] == "Ready" and c["status"] == "True"
+                        for c in n.get("status", {}).get("conditions", []))}
         if names <= ready:
             return
         time.sleep(0.5)
@@ -195,35 +166,14 @@ def _wait_for_nodes_ready(client, names, timeout):
                    "(check: podman logs schedsim)")
 
 
-def _wait_for_pods_gone(client, namespace, timeout):
-    deadline = time.time() + timeout
-    remaining = None
-    started = time.time()
-    last_print = 0
-    while time.time() < deadline:
-        left = len(client.list_pods(namespace))
-        if not left:
-            if remaining is not None:
-                yield {"phase": "pods terminated", "elapsed": round(time.time() - started, 1)}
-            return
-        if remaining is None or left < remaining:  # still draining, keep waiting
-            remaining, deadline = left, time.time() + timeout
-        now = time.time()
-        if now - last_print >= 1:  # tick even when the count hasn't moved
-            yield {"phase": "waiting for pods to terminate", "left": left,
-                   "elapsed": round(now - started)}
-            last_print = now
-        time.sleep(0.5)
-    raise KubeError(f"{remaining} pods in {namespace} did not terminate "
-                    f"within {timeout}s")
-
-
-def _wait_for_scheduling(client, namespace, expected, timeout):
+def _wait_for_scheduling(namespace, expected, timeout):
     """Poll until every pod is bound or unschedulable.
 
     `timeout` is the budget for making *no* progress: a large scenario can
     take far longer than that overall, so the deadline is extended each time
-    another pod settles.
+    another pod settles. kube-scheduler is a separate process, so this is
+    genuinely watching for external changes -- unlike the create/delete
+    calls above, which happen synchronously in this same process.
     """
     deadline = time.time() + timeout
     best = 0
@@ -231,7 +181,7 @@ def _wait_for_scheduling(client, namespace, expected, timeout):
     while time.time() < deadline:
         rows = {}
         settled = True
-        for pod in client.list_pods(namespace):
+        for pod in fakeapi.list_pods(namespace):
             name = pod["metadata"]["name"]
             node = pod["spec"].get("nodeName")
             if node:

@@ -2,19 +2,26 @@
 
 Stands in for etcd + kube-apiserver + kube-controller-manager + the KWOK
 node/pod-lifecycle controller, so the only real Kubernetes binary left in
-the image is the unmodified upstream kube-scheduler. It speaks just enough
-of the real REST surface -- object CRUD, JSON [strategic-]merge patch,
-list+watch, and the pods/binding subresource -- for a stock scheduler to
-run its informers, bind pods, and report scheduling failures against it.
+the image is the unmodified upstream kube-scheduler.
 
-Resource types the scheduler's informers watch but that schedsim never
-creates (PVs, PVCs, StorageClasses, CSI objects, controllers, PDBs) are
-served as ordinary, permanently-empty collections: List returns `[]` and
-Watch just idles, which is all a reflector needs to consider itself synced.
+Two kinds of resource live here:
 
-Mounted as a router into the same FastAPI app as /run (server/app.py), so
-one process is both "the cluster" and the thing driving simulations
-against it -- no separate apiserver process, no network hop.
+- LIVE: nodes, namespaces, pods (+ the pods/binding and */status
+  subresources). These are the ones schedsim actually creates, deletes and
+  reads, and the ones kube-scheduler binds pods onto and reports failures
+  against, so they get real CRUD, patch, and watch.
+- STUB: everything else the scheduler's informers watch on startup (PVs,
+  PVCs, StorageClasses, CSI objects, controllers, Services, PDBs, Events) so
+  they can sync -- but that schedsim never populates. These are served as
+  permanently-empty, watchable collections: List always returns `[]`, Watch
+  just idles. Events are additionally accepted (and discarded) on POST so
+  the scheduler's FailedScheduling events don't error.
+
+simulate.py, in the same process, calls the plain functions below (
+create_node, create_pod, list_pods, ...) directly -- no HTTP hop for the
+data schedsim itself writes. The FastAPI router further down is what the
+*external* kube-scheduler and kubectl processes actually talk to over real
+HTTP, and it's built on the exact same in-memory Store.
 """
 
 import asyncio
@@ -28,27 +35,9 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 router = APIRouter()
 
-# (group, resource) -> (version, Kind, namespaced). group "" is the core API
-# (served under /api/v1/...); every other group is served under
-# /apis/{group}/{version}/....
-REGISTRY = {
-    ("", "nodes"): ("v1", "Node", False),
-    ("", "namespaces"): ("v1", "Namespace", False),
-    ("", "persistentvolumes"): ("v1", "PersistentVolume", False),
-    ("", "pods"): ("v1", "Pod", True),
-    ("", "services"): ("v1", "Service", True),
-    ("", "replicationcontrollers"): ("v1", "ReplicationController", True),
-    ("", "persistentvolumeclaims"): ("v1", "PersistentVolumeClaim", True),
-    ("", "events"): ("v1", "Event", True),
-    ("apps", "replicasets"): ("v1", "ReplicaSet", True),
-    ("apps", "statefulsets"): ("v1", "StatefulSet", True),
-    ("policy", "poddisruptionbudgets"): ("v1", "PodDisruptionBudget", True),
-    ("storage.k8s.io", "storageclasses"): ("v1", "StorageClass", False),
-    ("storage.k8s.io", "csinodes"): ("v1", "CSINode", False),
-    ("storage.k8s.io", "csidrivers"): ("v1", "CSIDriver", False),
-    ("storage.k8s.io", "csistoragecapacities"): ("v1", "CSIStorageCapacity", True),
-    ("events.k8s.io", "events"): ("v1", "Event", True),
-}
+
+class AlreadyExists(Exception):
+    pass
 
 
 def _now():
@@ -56,9 +45,9 @@ def _now():
 
 
 class Store:
-    """All objects, keyed by (group, resource) then by name (cluster-scoped)
-    or "namespace/name" (namespaced). One global resourceVersion counter
-    across every resource type, same as real etcd."""
+    """LIVE objects only, keyed by (group, resource) then by name
+    (cluster-scoped) or "namespace/name" (namespaced). One global
+    resourceVersion counter across every resource type, same as real etcd."""
 
     def __init__(self):
         self._objects = {}
@@ -102,12 +91,54 @@ class Store:
 
 STORE = Store()
 
+# (group, resource) -> (version, Kind, namespaced)
+LIVE = {
+    ("", "nodes"): ("v1", "Node", False),
+    ("", "namespaces"): ("v1", "Namespace", False),
+    ("", "pods"): ("v1", "Pod", True),
+}
 
-# --- node/namespace/pod defaults, replacing kwok + the real controllers ----
+# Watched by a stock scheduler's informers but never written by schedsim.
+STUB = {
+    ("", "persistentvolumes"): ("v1", "PersistentVolume", False),
+    ("", "services"): ("v1", "Service", True),
+    ("", "replicationcontrollers"): ("v1", "ReplicationController", True),
+    ("", "persistentvolumeclaims"): ("v1", "PersistentVolumeClaim", True),
+    ("", "events"): ("v1", "Event", True),
+    ("apps", "replicasets"): ("v1", "ReplicaSet", True),
+    ("apps", "statefulsets"): ("v1", "StatefulSet", True),
+    ("policy", "poddisruptionbudgets"): ("v1", "PodDisruptionBudget", True),
+    ("storage.k8s.io", "storageclasses"): ("v1", "StorageClass", False),
+    ("storage.k8s.io", "csinodes"): ("v1", "CSINode", False),
+    ("storage.k8s.io", "csidrivers"): ("v1", "CSIDriver", False),
+    ("storage.k8s.io", "csistoragecapacities"): ("v1", "CSIStorageCapacity", True),
+    ("events.k8s.io", "events"): ("v1", "Event", True),
+}
+# The scheduler tries to record FailedScheduling events; accept (and drop)
+# them rather than making it log write errors. Nothing else is ever written
+# to a stub collection.
+STUB_WRITABLE = {"events"}
+
+
+# --- object creation, shared by simulate.py's direct calls and the HTTP layer
+
+def _stamp_new(obj, kind, api_version, namespace, name):
+    meta = obj.setdefault("metadata", {})
+    meta["name"] = name
+    if namespace is not None:
+        meta["namespace"] = namespace
+    meta["uid"] = meta.get("uid") or str(uuid.uuid4())
+    meta["creationTimestamp"] = meta.get("creationTimestamp") or _now()
+    meta.setdefault("labels", {})
+    meta.setdefault("annotations", {})
+    obj["kind"] = kind
+    obj["apiVersion"] = api_version
+    return obj
+
 
 def _hook_node(obj):
     """A real cluster needs a kubelet to report Ready; kwok faked that.
-    Here we just mark every node Ready the instant it's created."""
+    Here every node is just marked Ready the instant it's created."""
     status = obj.setdefault("status", {})
     conditions = [c for c in status.get("conditions", []) if c.get("type") != "Ready"]
     conditions.append({"type": "Ready", "status": "True", "reason": "FakeKubelet",
@@ -132,26 +163,88 @@ POST_CREATE_HOOKS = {
 }
 
 
-# --- helpers -----------------------------------------------------------------
+def create_object(group, resource, version, kind, namespaced, namespace, body):
+    """The one place any LIVE object gets created. Applies defaults, the
+    post-create hooks above, and publishes an ADDED watch event."""
+    meta = body.setdefault("metadata", {})
+    ns = namespace if namespaced else None
+    if namespaced and ns is None:
+        ns = meta.get("namespace") or "default"
+    name = meta.get("name")
+    if not name:
+        raise ValueError("metadata.name is required")
+    if STORE.get(group, resource, namespaced, ns, name) is not None:
+        raise AlreadyExists(f'{kind} "{name}" already exists')
+    api_version = version if not group else f"{group}/{version}"
+    _stamp_new(body, kind, api_version, ns, name)
+    body["metadata"]["resourceVersion"] = STORE.next_rv()
+    hook = POST_CREATE_HOOKS.get((group, resource))
+    if hook:
+        hook(body)
+    STORE.put(group, resource, namespaced, ns, name, body)
+    STORE.publish(group, resource, "ADDED", body)
+    return body
+
+
+def _cascade_delete_namespace(namespace):
+    """Stand-in for the namespace controller's garbage collection."""
+    for group, resource in LIVE:
+        _, _kind, namespaced = LIVE[(group, resource)]
+        if not namespaced:
+            continue
+        for obj in STORE.list(group, resource):
+            if obj.get("metadata", {}).get("namespace") == namespace:
+                STORE.delete(group, resource, True, namespace, obj["metadata"]["name"])
+                STORE.publish(group, resource, "DELETED", obj)
+
+
+# --- direct driver API -- what simulate.py calls, in-process, no HTTP -------
+
+def create_node(node):
+    return create_object("", "nodes", "v1", "Node", False, None, node)
+
+
+def create_namespace(name):
+    return create_object("", "namespaces", "v1", "Namespace", False, None, {"metadata": {"name": name}})
+
+
+def create_pod(namespace, pod):
+    return create_object("", "pods", "v1", "Pod", True, namespace, pod)
+
+
+def list_nodes():
+    return STORE.list("", "nodes")
+
+
+def list_pods(namespace):
+    return [o for o in STORE.list("", "pods") if o.get("metadata", {}).get("namespace") == namespace]
+
+
+def delete_node(name):
+    obj = STORE.delete("", "nodes", False, None, name)
+    if obj is not None:
+        STORE.publish("", "nodes", "DELETED", obj)
+
+
+def delete_pod(namespace, name):
+    obj = STORE.delete("", "pods", True, namespace, name)
+    if obj is not None:
+        STORE.publish("", "pods", "DELETED", obj)
+
+
+def delete_namespace(name):
+    obj = STORE.delete("", "namespaces", False, None, name)
+    if obj is not None:
+        STORE.publish("", "namespaces", "DELETED", obj)
+    _cascade_delete_namespace(name)
+
+
+# --- HTTP helpers ------------------------------------------------------------
 
 def _status(code, reason, message):
     return JSONResponse({"kind": "Status", "apiVersion": "v1", "status": "Failure",
                           "message": message, "reason": reason, "code": code},
                         status_code=code)
-
-
-def _stamp_new(obj, kind, api_version, namespace, name):
-    meta = obj.setdefault("metadata", {})
-    meta["name"] = name
-    if namespace is not None:
-        meta["namespace"] = namespace
-    meta["uid"] = meta.get("uid") or str(uuid.uuid4())
-    meta["creationTimestamp"] = meta.get("creationTimestamp") or _now()
-    meta.setdefault("labels", {})
-    meta.setdefault("annotations", {})
-    obj["kind"] = kind
-    obj["apiVersion"] = api_version
-    return obj
 
 
 def _merge_patch(dst, patch):
@@ -171,46 +264,8 @@ def _merge_patch(dst, patch):
     return dst
 
 
-def _pointer_parts(path):
-    return [p.replace("~1", "/").replace("~0", "~") for p in path.strip("/").split("/") if p != ""]
-
-
-def _apply_json_patch(obj, ops):
-    """Minimal RFC 6902 subset: add/replace/remove. No copy/move/test."""
-    for op in ops:
-        parts = _pointer_parts(op.get("path", ""))
-        if not parts:
-            continue
-        *head, last = parts
-        cur = obj
-        for p in head:
-            cur = cur[int(p)] if isinstance(cur, list) else cur.setdefault(p, {})
-        if op["op"] in ("add", "replace"):
-            if isinstance(cur, list):
-                if last == "-":
-                    cur.append(op["value"])
-                else:
-                    cur[int(last)] = op["value"]
-            else:
-                cur[last] = op["value"]
-        elif op["op"] == "remove":
-            if isinstance(cur, list):
-                cur.pop(int(last))
-            else:
-                cur.pop(last, None)
-
-
 def _truthy(v):
     return v in ("1", "true", "True")
-
-
-def _dotted(obj, path):
-    cur = obj
-    for part in path.split("."):
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(part)
-    return cur
 
 
 def _label_match(labels, selector):
@@ -231,43 +286,19 @@ def _label_match(labels, selector):
     return True
 
 
-def _field_match(obj, selector):
-    for clause in filter(None, (c.strip() for c in selector.split(","))):
-        neg = "!=" in clause
-        sep = "!=" if neg else "="
-        if sep not in clause:
-            continue
-        k, v = clause.split(sep, 1)
-        if (str(_dotted(obj, k.strip())) == v.strip()) == neg:
-            return False
-    return True
-
-
-def _apply_selectors(items, label_selector, field_selector):
-    if label_selector:
-        items = [o for o in items if _label_match(o.get("metadata", {}).get("labels", {}), label_selector)]
-    if field_selector:
-        items = [o for o in items if _field_match(o, field_selector)]
-    return items
-
-
-def _cascade_delete_namespace(namespace):
-    """Stand-in for the namespace controller's garbage collection."""
-    for (g, r), (_v, _k, namespaced) in REGISTRY.items():
-        if not namespaced:
-            continue
-        for obj in STORE.list(g, r):
-            if obj.get("metadata", {}).get("namespace") == namespace:
-                STORE.delete(g, r, True, namespace, obj["metadata"]["name"])
-                STORE.publish(g, r, "DELETED", obj)
-
-
 # --- discovery -----------------------------------------------------------------
 
 def _resource_entries(group):
-    entries = [{"name": r, "namespaced": namespaced, "kind": kind,
-                "verbs": ["get", "list", "watch", "create", "delete", "patch", "update"]}
-               for (g, r), (_v, kind, namespaced) in REGISTRY.items() if g == group]
+    entries = []
+    for (g, r), (_v, kind, namespaced) in {**LIVE, **STUB}.items():
+        if g != group:
+            continue
+        verbs = ["get", "list", "watch"]
+        if (g, r) in LIVE:
+            verbs += ["create", "delete", "patch", "update"]
+        elif r in STUB_WRITABLE:
+            verbs.append("create")
+        entries.append({"name": r, "namespaced": namespaced, "kind": kind, "verbs": verbs})
     if group == "":
         entries += [
             {"name": "pods/binding", "namespaced": True, "kind": "Binding", "verbs": ["create"]},
@@ -285,7 +316,7 @@ def api_versions():
 
 @router.get("/apis")
 def apis_root():
-    groups = sorted({g for (g, _r) in REGISTRY if g != ""})
+    groups = sorted({g for (g, _r) in STUB if g != ""})
     return {"kind": "APIGroupList", "apiVersion": "v1", "groups": [
         {"name": g, "versions": [{"groupVersion": f"{g}/v1", "version": "v1"}],
          "preferredVersion": {"groupVersion": f"{g}/v1", "version": "v1"}}
@@ -327,7 +358,16 @@ async def _watch_stream(request, group, resource, namespace):
         STORE.watchers(group, resource).remove(queue)
 
 
-# --- CRUD --------------------------------------------------------------------
+async def _idle_watch(request):
+    """A watch on a STUB collection: nothing is ever published to it, so
+    just hold the connection open, sending keepalives, until the client
+    goes away."""
+    while not await request.is_disconnected():
+        await asyncio.sleep(15)
+        yield "\n"
+
+
+# --- LIVE CRUD ---------------------------------------------------------------
 
 async def _list(request, group, resource, version, kind, namespaced, namespace):
     if _truthy(request.query_params.get("watch")):
@@ -336,8 +376,9 @@ async def _list(request, group, resource, version, kind, namespaced, namespace):
     items = STORE.list(group, resource)
     if namespace is not None:
         items = [o for o in items if o.get("metadata", {}).get("namespace") == namespace]
-    items = _apply_selectors(items, request.query_params.get("labelSelector"),
-                             request.query_params.get("fieldSelector"))
+    label_selector = request.query_params.get("labelSelector")
+    if label_selector:
+        items = [o for o in items if _label_match(o.get("metadata", {}).get("labels", {}), label_selector)]
     api_version = version if not group else f"{group}/{version}"
     return JSONResponse({"kind": kind + "List", "apiVersion": api_version,
                           "metadata": {"resourceVersion": STORE.current_rv()}, "items": items})
@@ -348,22 +389,13 @@ async def _create(request, group, resource, version, kind, namespaced, namespace
         body = await request.json()
     except ValueError:
         return _status(400, "BadRequest", "invalid JSON body")
-    meta = body.setdefault("metadata", {})
-    ns = namespace or meta.get("namespace") or ("default" if namespaced else None)
-    name = meta.get("name")
-    if not name:
-        return _status(422, "Invalid", "metadata.name is required")
-    if STORE.get(group, resource, namespaced, ns, name) is not None:
-        return _status(409, "AlreadyExists", f'{kind} "{name}" already exists')
-    api_version = version if not group else f"{group}/{version}"
-    _stamp_new(body, kind, api_version, ns if namespaced else None, name)
-    body["metadata"]["resourceVersion"] = STORE.next_rv()
-    hook = POST_CREATE_HOOKS.get((group, resource))
-    if hook:
-        hook(body)
-    STORE.put(group, resource, namespaced, ns if namespaced else None, name, body)
-    STORE.publish(group, resource, "ADDED", body)
-    return JSONResponse(body, status_code=201)
+    try:
+        obj = create_object(group, resource, version, kind, namespaced, namespace, body)
+    except AlreadyExists as e:
+        return _status(409, "AlreadyExists", str(e))
+    except ValueError as e:
+        return _status(422, "Invalid", str(e))
+    return JSONResponse(obj, status_code=201)
 
 
 async def _bind_pod(request, namespace, name):
@@ -387,11 +419,15 @@ async def _update(request, group, resource, namespaced, namespace, name, kind, s
     obj = STORE.get(group, resource, namespaced, namespace, name)
     if obj is None:
         return _status(404, "NotFound", f'{kind} "{name}" not found')
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("application/json-patch+json"):
+        return _status(415, "UnsupportedMediaType",
+                       "this fake apiserver only understands merge-patch/"
+                       "strategic-merge-patch/apply-patch, not JSON Patch")
     try:
         body = await request.json()
     except ValueError:
         return _status(400, "BadRequest", "invalid patch/update body")
-    content_type = request.headers.get("content-type", "")
     if replace:
         if subresource:
             obj[subresource] = body.get(subresource, body)
@@ -399,8 +435,6 @@ async def _update(request, group, resource, namespaced, namespace, name, kind, s
             body["metadata"] = obj["metadata"]  # identity survives a full replace
             obj.clear()
             obj.update(body)
-    elif content_type.startswith("application/json-patch+json"):
-        _apply_json_patch(obj, body)
     elif subresource:
         # Body shape from client-go's typed Patch(..., subresource) call is
         # a full object with only that subresource populated, e.g.
@@ -415,30 +449,20 @@ async def _update(request, group, resource, namespaced, namespace, name, kind, s
 
 
 async def _delete(group, resource, namespaced, namespace, name, kind):
-    obj = STORE.delete(group, resource, namespaced, namespace, name)
+    obj = STORE.get(group, resource, namespaced, namespace, name)
     if obj is None:
         return _status(404, "NotFound", f'{kind} "{name}" not found')
+    STORE.delete(group, resource, namespaced, namespace, name)
     STORE.publish(group, resource, "DELETED", obj)
     if group == "" and resource == "namespaces":
         _cascade_delete_namespace(name)
     return JSONResponse(obj)
 
 
-# --- routing -----------------------------------------------------------------
-
-async def _dispatch(request, group, version, rest):
-    if rest[0] == "namespaces" and len(rest) >= 3:
-        namespace, resource, *tail = rest[1:]
-    else:
-        namespace, resource, tail = None, rest[0], rest[1:]
-
-    spec = REGISTRY.get((group, resource))
-    if not spec or spec[0] != version:
-        return _status(404, "NotFound", f"the server could not find the requested resource ({resource})")
-    _, kind, namespaced = spec
+async def _dispatch_live(request, group, version, resource, namespace, tail):
+    _, kind, namespaced = LIVE[(group, resource)]
     if namespace is not None and not namespaced:
         return _status(404, "NotFound", f"{resource} is not a namespaced resource")
-
     name = tail[0] if tail else None
     subresource = tail[1] if len(tail) >= 2 else None
     method = request.method
@@ -462,6 +486,54 @@ async def _dispatch(request, group, version, rest):
         return await _update(request, group, resource, namespaced, namespace, name, kind,
                              subresource, replace=(method == "PUT"))
     return _status(405, "MethodNotAllowed", f"{method} not supported")
+
+
+# --- STUB collections: always empty, watchable, read-only (except events) --
+
+async def _dispatch_stub(request, group, version, resource, namespace, tail):
+    _, kind, namespaced = STUB[(group, resource)]
+    if namespace is not None and not namespaced:
+        return _status(404, "NotFound", f"{resource} is not a namespaced resource")
+    method = request.method
+
+    if tail:  # nothing is ever stored, so any single-object path is 404/405
+        return (_status(404, "NotFound", f'{kind} "{tail[0]}" not found') if method == "GET"
+                else _status(405, "MethodNotAllowed", f"{method} not supported"))
+
+    if method == "GET":
+        if _truthy(request.query_params.get("watch")):
+            return StreamingResponse(_idle_watch(request), media_type="application/json")
+        api_version = version if not group else f"{group}/{version}"
+        return JSONResponse({"kind": kind + "List", "apiVersion": api_version,
+                              "metadata": {"resourceVersion": STORE.current_rv()}, "items": []})
+
+    if method == "POST" and resource in STUB_WRITABLE:
+        try:
+            body = await request.json()
+        except ValueError:
+            return _status(400, "BadRequest", "invalid JSON body")
+        meta = body.setdefault("metadata", {})
+        name = meta.get("name") or meta.get("generateName", "event") + uuid.uuid4().hex[:8]
+        api_version = version if not group else f"{group}/{version}"
+        _stamp_new(body, kind, api_version, namespace if namespaced else None, name)
+        return JSONResponse(body, status_code=201)  # accepted, not retained
+
+    return _status(405, "MethodNotAllowed", f"{method} not supported on a collection")
+
+
+# --- routing -----------------------------------------------------------------
+
+async def _dispatch(request, group, version, rest):
+    if rest[0] == "namespaces" and len(rest) >= 3:
+        namespace, resource, *tail = rest[1:]
+    else:
+        namespace, resource, tail = None, rest[0], rest[1:]
+
+    if (group, resource) in LIVE and LIVE[(group, resource)][0] == version:
+        return await _dispatch_live(request, group, version, resource, namespace, tail)
+    if (group, resource) in STUB and STUB[(group, resource)][0] == version:
+        return await _dispatch_stub(request, group, version, resource, namespace, tail)
+    return _status(404, "NotFound", f"the server could not find the requested resource ({resource})")
 
 
 @router.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

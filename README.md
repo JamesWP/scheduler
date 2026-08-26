@@ -146,18 +146,24 @@ The core logic (`image/server/`) runs *inside* the container as a single
 FastAPI service that is both "the cluster" and the thing driving
 simulations against it:
 
-- `simulate.py` + `app.py` expose `POST /run`, same as before.
-- `fakeapi.py` is a fake, in-memory Kubernetes API server mounted into that
-  same app — the *only* other thing left in the image is the unmodified
-  upstream kube-scheduler binary, talking to `fakeapi.py` over plain HTTP
-  exactly as it would to a real apiserver. There's no etcd, no real
-  kube-apiserver, no kube-controller-manager, and no KWOK controller: the
-  fake apiserver marks nodes Ready and binds pods itself, synchronously, the
-  moment it sees them, and cascades a namespace delete to everything in it
-  (standing in for the node-lifecycle and namespace controllers). Resource
-  types the scheduler's informers watch but this simulator never populates
-  (PVs, PVCs, StorageClasses, CSI objects, PDBs, ...) are just served as
-  permanently-empty, watchable collections.
+- `fakeapi.py` is a fake, in-memory Kubernetes API server: an in-memory
+  store plus a FastAPI router mounted into the same app as `POST /run`.
+  It only gives real CRUD/patch/watch to the three resource types anything
+  actually writes to — Nodes, Namespaces, Pods (the *only* other thing left
+  in the image is the unmodified upstream kube-scheduler binary, talking to
+  these over plain HTTP exactly as it would to a real apiserver). There's
+  no etcd, no real kube-apiserver, no kube-controller-manager, and no KWOK
+  controller: `fakeapi.py` marks nodes Ready and cascades a namespace
+  delete to everything in it itself, synchronously, as part of handling the
+  write (standing in for the node-lifecycle and namespace controllers).
+  Everything else the scheduler's informers watch on startup but this
+  simulator never populates (PVs, PVCs, StorageClasses, CSI objects,
+  Services, controllers, PDBs) is just served as a permanently-empty,
+  watchable collection — enough for an informer to sync against, nothing more.
+- `simulate.py` calls `fakeapi.py`'s store directly — plain Python function
+  calls, not HTTP — since they run in the same process; only the external
+  kube-scheduler and kubectl processes go through the HTTP router.
+  `app.py` wires `POST /run` to `simulate.run()`.
 
 The `POST /run` flow itself:
 

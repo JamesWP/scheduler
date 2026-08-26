@@ -10,17 +10,18 @@ still executes locally even though the write back to the client will fail).
 This same app also serves the fake Kubernetes API (fakeapi.py) that stands
 in for etcd + kube-apiserver + kube-controller-manager + kwok -- one process
 is both "the cluster" that the unmodified kube-scheduler binary talks to and
-the thing driving simulations against it.
+the thing driving simulations against it. simulate.py calls fakeapi.py
+directly (no HTTP, they're the same process); only the external
+kube-scheduler and kubectl processes go through the router below.
 """
 
 import json
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import fakeapi, simulate
-from .kube import KubeClient, KubeError
 
 app = FastAPI()
 app.include_router(fakeapi.router)
@@ -36,8 +37,8 @@ class RunRequest(BaseModel):
 
 @app.get("/healthz")
 def healthz():
-    if not KubeClient().ready():
-        return JSONResponse({"status": "apiserver not ready"}, status_code=503)
+    # No separate apiserver process to check anymore -- being able to
+    # answer this request at all means the whole control plane is up.
     return {"status": "ok"}
 
 
@@ -46,14 +47,13 @@ def run(req: RunRequest):
     config = {"nodes": req.nodes, "workloads": req.workloads}
 
     def stream():
-        client = KubeClient()
         try:
-            for event in simulate.run(client, config, timeout=req.timeout, keep=req.keep):
+            for event in simulate.run(config, timeout=req.timeout, keep=req.keep):
                 if req.progress or event["phase"] in ("done", "error"):
                     yield json.dumps(event) + "\n"
         except Exception as e:
-            # Any failure (expected SimError/KubeError, or a bug) becomes a
-            # terminal line rather than a silently truncated stream.
+            # Any failure (expected SimError, or a bug) becomes a terminal
+            # line rather than a silently truncated stream.
             yield json.dumps({"phase": "error", "message": str(e)}) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
