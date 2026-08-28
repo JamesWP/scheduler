@@ -140,6 +140,16 @@ token, same `AlwaysAllow` spirit a real apiserver would run this sim under).
 It's the same port and the same process as the run API — same trust level
 as the podman socket that already controls the container.
 
+## Alternative backend (exploratory)
+
+[`goserver/`](goserver/README.md) explores a different way to answer the
+same question: instead of running the real kube-scheduler *binary*
+against a fake apiserver, it imports `k8s.io/kubernetes/pkg/scheduler` as
+a Go library and calls it directly against a fake `client-go` clientset.
+Same `GET /healthz` / `POST /run` API as the container above, much less
+custom code behind it — and a real trade-off against running the actual
+binary. See its README for the design and the trade-offs.
+
 ## How it works
 
 The core logic (`image/server/`) runs *inside* the container as a single
