@@ -14,11 +14,15 @@ import (
 
 // Row is one pod's final placement, mirroring the dicts
 // image/server/simulate.py's run() yields in its "done" event's rows.
+// Node is a pointer (JSON null, not an omitted key) because the CLI's
+// presentation.py indexes rows["node"] unconditionally -- omitting the
+// key on an unscheduled pod would be a KeyError there, not a graceful
+// falsy value.
 type Row struct {
-	Pod      string `json:"pod"`
-	Node     string `json:"node,omitempty"`
-	Status   string `json:"status"`
-	Workload string `json:"workload"`
+	Pod      string  `json:"pod"`
+	Node     *string `json:"node"`
+	Status   string  `json:"status"`
+	Workload string  `json:"workload"`
 }
 
 // Event is one NDJSON progress line, keyed the same way
@@ -157,7 +161,8 @@ func waitForScheduling(ctx context.Context, client kubernetes.Interface, namespa
 		for i := range list.Items {
 			pod := &list.Items[i]
 			if pod.Spec.NodeName != "" {
-				rows[pod.Name] = Row{Pod: pod.Name, Node: pod.Spec.NodeName,
+				nodeName := pod.Spec.NodeName
+				rows[pod.Name] = Row{Pod: pod.Name, Node: &nodeName,
 					Status: "Scheduled", Workload: workloadOf(pod)}
 				continue
 			}
