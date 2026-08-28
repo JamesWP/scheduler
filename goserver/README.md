@@ -105,6 +105,14 @@ plus, unlike the binary, regenerating the `replace` block from upstream's
 - Node objects are still stamped `Ready=True` for informational parity,
   though no in-tree default plugin actually gates on it (only
   `.spec.unschedulable` and taints do).
+- The fake clientset's watch implementation is unit-test-shaped: each
+  watcher is a fixed-size buffered channel that panics rather than
+  applying backpressure if a burst of writes outruns whatever's draining
+  it. `cluster.go` raises that buffer process-wide at startup so a
+  several-thousand-pod run's cleanup (a tight loop of individual Delete
+  calls) doesn't overrun it — found by actually running a
+  `schedsim gen --nodes 500 --workloads 500` scenario through it, which
+  panicked with the default buffer. A real apiserver has no such limit.
 
 ## Running it
 

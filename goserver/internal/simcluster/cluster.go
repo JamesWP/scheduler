@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
@@ -63,6 +64,19 @@ type Cluster struct {
 // returns once the informer caches have synced. ctx controls the
 // scheduler's lifetime; cancel it to shut the whole control plane down.
 func New(ctx context.Context) (*Cluster, error) {
+	// The fake watch implementation client-go's ObjectTracker hands out is
+	// unit-test-shaped: each watcher is a 100-event buffered channel that
+	// *panics* ("channel full") instead of applying backpressure once a
+	// burst of writes outruns whatever's draining it -- fine for a test
+	// creating a handful of objects, not for run.go deleting several
+	// thousand pods back to back at cleanup. There's no per-clientset knob
+	// for this, only this package-level default consulted whenever a new
+	// watcher is handed out (informer startup below, in particular), so it
+	// has to be raised process-wide before that happens. A real apiserver
+	// has no such limit; this is a real behavioural gap between the two
+	// backends, not just an implementation nicety (see README.md).
+	watch.DefaultChanSize = 100_000
+
 	client := fakeclientset.NewClientset()
 	addBindingReactor(client)
 	addUIDReactor(client)
